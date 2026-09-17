@@ -9,3 +9,4 @@ dist/
 coverage.out
 file_coverage.html
 file_coverage.out
+/cleanenv

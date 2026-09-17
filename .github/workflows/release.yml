@@ -4,93 +4,50 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to update to (e.g., v1.2.3)'
+        description: 'Version to release (e.g., v1.2.3)'
         required: true
 
 jobs:
-  update-version:
+  release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 需要写入权限来直接提交更改
-      
+      contents: write
+
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main  # 总是检出 main 分支
+          ref: main
           token: ${{ secrets.GITHUB_TOKEN }}
-        
+          fetch-depth: 0
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25.6'
-          
-      - name: Validate and use input version
-        id: get_version
+          go-version-file: go.mod
+          cache: true
+
+      - name: Validate version
         run: |
-          VERSION=${{ github.event.inputs.version }}
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "Using input version: $VERSION"
-          
-          # 验证版本格式
-          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-            echo "Error: Version does not match pattern vX.Y.Z"
+          VERSION="${{ github.event.inputs.version }}"
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]]; then
+            echo "Error: version must look like vX.Y.Z"
             exit 1
           fi
-          
-      - name: Update version in source code
-        run: |
-          # 替换 cmd/protoc-gen-gonfig/main.go 文件中的版本号
-          sed -i "s/var Version = \".*\"/var Version = \"$VERSION\"/" cmd/protoc-gen-gonfig/main.go
-          echo "Updated version in cmd/protoc-gen-gonfig/main.go to $VERSION"
-          
-          # 更新 resource/nacos/go.mod 文件中的版本
-          sed -i "s|github.com/soyacen/gonfig v[0-9]\+\.[0-9]\+\.[0-9]\+|github.com/soyacen/gonfig $VERSION|g" resource/nacos/go.mod
-          echo "Updated version in resource/nacos/go.mod to $VERSION"
-          
-          # 更新 resource/consul/go.mod 文件中的版本
-          sed -i "s|github.com/soyacen/gonfig v[0-9]\+\.[0-9]\+\.[0-9]\+|github.com/soyacen/gonfig $VERSION|g" resource/consul/go.mod
-          echo "Updated version in resource/consul/go.mod to $VERSION"
-          
-          # 更新 example/nacos/go.mod 文件中的版本
-          sed -i "s|github.com/soyacen/gonfig v[0-9]\+\.[0-9]\+\.[0-9]\+|github.com/soyacen/gonfig $VERSION|g" example/nacos/go.mod
-          sed -i "s|github.com/soyacen/gonfig/resource/nacos v[0-9]\+\.[0-9]\+\.[0-9]\+|github.com/soyacen/gonfig/resource/nacos $VERSION|g" example/nacos/go.mod
-          echo "Updated versions in example/nacos/go.mod to $VERSION"
-          
-      - name: Commit and push changes directly
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Releasing $VERSION"
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Create and push tag
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add cmd/protoc-gen-gonfig/main.go
-          git add resource/nacos/go.mod
-          git add resource/consul/go.mod
-          git add example/nacos/go.mod
-          git commit -m "chore: update version to $VERSION"
-          git push
-          
-      - name: Create and push tag
-        run: |
-          git tag resource/consul/$VERSION
-          git push origin resource/consul/$VERSION
-          git tag resource/nacos/$VERSION
-          git push origin resource/nacos/$VERSION
-          git tag ${{ env.VERSION }}
-          git push origin ${{ env.VERSION }}
-          echo "Tag ${{ env.VERSION }} created and pushed successfully"
-          
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
       - name: Create GitHub Release
-        id: create_release
-        uses: actions/create-release@v1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ env.VERSION }}
-          release_name: Release ${{ env.VERSION }}
-          draft: false
-          prerelease: false
-          
-      - name: Output completion message
-        run: |
-          echo "Version updated to ${{ env.VERSION }}"
-          echo "Tag ${{ env.VERSION }} has been created and pushed automatically"
-          echo "Release workflow will run automatically after pushing the tag."
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$VERSION" --title "Release $VERSION" --generate-notes

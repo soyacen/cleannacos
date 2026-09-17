@@ -1,207 +1,205 @@
-# gonfig - Go 配置管理库
+# cleannacos - cleanenv 风格的 Nacos 配置读取库
 
-gonfig 是一个功能强大的 Go 语言配置管理库，支持多种配置源和格式，提供了统一的配置加载和监听机制。
+`cleannacos` 把 [cleanenv](https://github.com/ilyakaznacheev/cleanenv) 的「本地文件源」替换为「Nacos 配置源」，解析、环境变量覆盖、默认值、描述生成全部复用 upstream cleanenv，本库只负责取数、合并编排与变更监听。
+
+迁移成本的目标是「只改 import 路径」：
+
+```go
+// 之前：cleanenv
+err := cleanenv.ReadConfig("config.yaml", &cfg)
+
+// 之后：cleannacos
+err := cleannacos.ReadConfig(ctx, "nacos://127.0.0.1:8848/config.yaml?group=DEFAULT_GROUP", &cfg)
+```
+
+原有的 struct tag 全部通用：`env` / `env-default` / `env-upd` / `env-description` / `env-required` / `env-prefix` / `env-separator` / `env-layout`。
 
 ## 特性
 
-- **多源支持**：支持从环境变量、文件、Consul、Nacos 等多种来源加载配置
-- **多格式支持**：内置支持 JSON、YAML、TOML、ENV 等常见配置格式
-- **热更新**：支持配置变更监听和自动重新加载
-- **Protobuf 集成**：与 Protobuf 深度集成，可自动生成配置管理代码
-- **类型安全**：基于结构化数据和强类型配置对象
-- **易于扩展**：提供清晰的接口用于添加新的配置源和格式
+- **API 对齐**：`ReadConfig` / `UpdateConfig` / `ReadEnv` / `UpdateEnv` / `GetDescription` / `Usage` / `FUsage` 与 cleanenv 同名同签名。
+- **语义一致**：合并顺序固定为 **Nacos 内容 → 环境变量覆盖 → env-default**，与 cleanenv 的 file → env → default 一一对应；`env-required`、`env-prefix`、`env-separator`、`env-layout` 等语义直接复用 cleanenv。
+- **多格式**：`.yaml` / `.yml` / `.json` / `.toml` / `.env` / `.edn`，由 dataId 后缀决定解析器。
+- **变更监听**：`Watch[T]` 泛型回调，回调串行化，配合 `atomic.Pointer[T]` 即可无数据竞争地热更新。
 
 ## 安装
 
 ```bash
-go get github.com/soyacen/gonfig@latest
-```
-
-## 安装 protoc-gen-gonfig 插件
-
-```bash
-go install github.com/soyacen/gonfig/cmd/protoc-gen-gonfig@latest
+go get github.com/soyacen/cleannacos
 ```
 
 ## 快速开始
-
-### 1. 定义配置结构
-
-首先使用 Protobuf 定义配置结构，消息名称必须是 `Config`、`Conf` 或 `Configuration` 之一：
-
-```protobuf
-syntax = "proto3";
-package example;
-option go_package = "github.com/soyacen/gonfig/example/configs;configs";
-
-message Config {
-  string addr = 1;
-  int32 port = 2;
-  string environment = 3;
-}
-```
-
-运行以下命令生成代码：
-
-```bash
-protoc --go_out=. --gonfig_out=. configs/*.proto
-```
-
-### 2. 使用环境变量配置
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-    "os"
-    "time"
-    
-    "github.com/soyacen/gonfig/example/configs"
-    "github.com/soyacen/gonfig/resource/env"
+	"context"
+	"log"
+
+	"github.com/soyacen/cleannacos"
 )
 
+type Config struct {
+	Addr  string `yaml:"addr" env:"ADDR" env-default:"localhost:8080" env-description:"监听地址"`
+	Port  int    `yaml:"port" env:"PORT" env-default:"8080" env-description:"监听端口"`
+	Debug bool   `yaml:"debug" env:"DEBUG" env-default:"false"`
+}
+
 func main() {
-    // 设置环境变量
-    os.Setenv("ADDR", "localhost")
-    os.Setenv("PORT", "8080")
-    os.Setenv("ENVIRONMENT", "development")
-    
-    // 创建环境变量资源配置
-    envResource, err := env.New("", time.Second)
-    if err != nil {
-        panic(err)
-    }
-    
-    // 加载配置
-    if err := configs.LoadConfig(context.TODO(), envResource); err != nil {
-        panic(err)
-    }
-    
-    // 获取配置
-    config := configs.GetConfig()
-    fmt.Printf("Address: %s\n", config.Addr)
-    fmt.Printf("Port: %d\n", config.Port)
-    fmt.Printf("Environment: %s\n", config.Environment)
-    
-    // 也可以直接获取字段值
-    fmt.Printf("Direct field access - Address: %s\n", configs.GetAddr())
-    fmt.Printf("Direct field access - Port: %d\n", configs.GetPort())
-    fmt.Printf("Direct field access - Environment: %s\n", configs.GetEnvironment())
+	var cfg Config
+
+	// 读取 Nacos 内容 → 环境变量覆盖 → env-default
+	if err := cleannacos.ReadConfig(context.Background(), "nacos://127.0.0.1:8848/config.yaml?group=DEFAULT_GROUP", &cfg); err != nil {
+		log.Fatal(err)
+	}
+
+	// 打印支持的变量、说明与默认值
+	description, err := cleannacos.GetDescription(&cfg, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println(description)
+
+	// 手动重新拉取（无监听器的刷新场景）
+	if err := cleannacos.UpdateConfig(context.Background(), "nacos://127.0.0.1:8848/config.yaml?group=DEFAULT_GROUP", &cfg); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
-### 3. 监听配置变化
+可运行示例见 [example/simple](example/simple) 与 [example/watch](example/watch)。
+
+## DSN 规范
+
+```
+nacos://user:pass@host:8848/dataId.yaml?namespace=ns&group=g&timeoutMs=5000&logDir=/tmp/nacos/log&cacheDir=/tmp/nacos/cache&logLevel=debug&notLoadCacheAtStart=true&appName=xxx&allowEmpty=true
+```
+
+- 只支持 `nacos://` scheme 与单台 `host:port`。
+- path 只承载 **dataId**，必须带后缀（`.yaml` / `.yml` / `.json` / `.toml` / `.env` / `.edn`，大小写不敏感），后缀决定解析器；缺失或未知后缀直接报错。
+- dataId 可以包含 `/`：`nacos://host:8848/group/app.yaml` 对应的 dataId 是 `group/app.yaml`。
+
+| query 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `namespace` | `""` | Nacos 命名空间，空串即 public |
+| `group` | `DEFAULT_GROUP` | 配置分组 |
+| `timeoutMs` | SDK 默认 | Nacos 客户端超时（毫秒） |
+| `logDir` | `/tmp/nacos/log` | Nacos SDK 日志目录 |
+| `cacheDir` | `/tmp/nacos/cache` | Nacos SDK 本地缓存目录 |
+| `logLevel` | SDK 默认 | Nacos SDK 日志级别 |
+| `notLoadCacheAtStart` | SDK 默认 | 启动时不加载本地缓存 |
+| `appName` | SDK 默认 | Nacos 客户端 appName |
+| `allowEmpty` | `false` | 内容为空时是否按空配置处理 |
+
+用户名和密码通过 DSN 的 userinfo 传递（`nacos://admin:nacos@host:8848/...`）。已知参数的非法值（非数字 `timeoutMs`、非布尔 `notLoadCacheAtStart`/`allowEmpty`、非法端口等）会直接报错，未知 query 参数忽略。
+
+取不到内容时（Nacos 返回空串且无错误）按 cleanenv「文件不存在」对齐返回明确错误：
+
+```
+cleannacos: config "app.yaml" (group "DEFAULT_GROUP", namespace "") is empty or not found, set allowEmpty=true to read it as an empty config
+```
+
+确需空配置时用 `allowEmpty=true` 放开，此时跳过内容解析，只执行环境变量覆盖与 env-default。
+
+## 变更监听
+
+`Watch` 会先注册 Nacos listener，再立即拉取一次基线快照并**同步**回调，因此 `Watch` 返回时回调至少已经被调用过一次；之后的变更以异步方式回调，每次传入全新的 `*T`，并且回调之间串行化：
 
 ```go
-errFunc := func(err error) {
-    fmt.Printf("配置监听错误: %v\n", err)
+type Config struct {
+	Addr  string `yaml:"addr" env:"ADDR" env-default:"localhost:8080"`
+	Debug bool   `yaml:"debug" env:"DEBUG" env-default:"false"`
 }
 
-// 开始监听配置变化
-stop, err := configs.WatchConfig(context.TODO(), envResource, errFunc)
+var current atomic.Pointer[Config]
+
+stop, err := cleannacos.Watch(ctx, dsn, func(conf *Config) {
+	current.Store(conf) // 回调已串行化，atomic 替换即可
+})
 if err != nil {
-    panic(err)
+	return err
 }
-defer stop(context.TODO())
+defer func() { _ = stop(ctx) }()
+
+cfg := current.Load() // 此时已是基线快照
 ```
 
-## 支持的配置源
+行为约定：
 
-### 1. 环境变量 (env)
+- 每次变更都重跑完整合并（Nacos → env → default），不区分 `env-upd`；`env-upd` 语义仍由 `UpdateEnv` 单独承担。
+- `Watch` 不写调用方任何变量，只通过回调把新的 `*T` 交出去。
+- 相同内容去重：只有成功解析的内容才会成为新的基线，因此 `good → 坏内容 → 同一 good` 不会再触发回调。
+- 坏内容（解析失败）只走 `errorHandler`，不回调；未提供 `WithErrorHandler` 时默认用 `slog.Error` 输出。
+- 取消传给 `Watch` 的 `ctx` 会静默停止；`StopFunc` 幂等，首次调用取消 listener 并关闭客户端。
+- 基线拉取失败（网络错误 / dataId 不存在 / 内容解析失败）时，`Watch` 取消 listener、关闭客户端并返回错误。
+
+## API
 
 ```go
-import "github.com/soyacen/gonfig/resource/env"
+// Nacos 内容 → env 覆盖 → env-default，语义与 cleanenv.ReadConfig 一致
+func ReadConfig(ctx context.Context, dsn string, cfg interface{}) error
 
-resource, err := env.New("PREFIX_", time.Second)
+// 手动重新拉取并全量重合并（无监听器的刷新场景）
+func UpdateConfig(ctx context.Context, dsn string, cfg interface{}) error
+
+// 与 cleanenv 完全同名同签名，直接委托
+func ReadEnv(cfg interface{}) error
+func UpdateEnv(cfg interface{}) error
+func GetDescription(cfg interface{}, headerText *string) (string, error)
+func Usage(cfg interface{}, headerText *string, usageFuncs ...func()) func()
+func FUsage(w io.Writer, cfg interface{}, headerText *string, usageFuncs ...func()) func()
+
+// 变更监听：泛型回调「新的 *T」
+type StopFunc func(ctx context.Context) error
+type ErrFunc func(err error)
+type WatchOption func(*watchOptions)
+
+func WithErrorHandler(errFunc ErrFunc) WatchOption
+func Watch[T any](ctx context.Context, dsn string, notify func(conf *T), options ...WatchOption) (StopFunc, error)
 ```
 
-### 2. 文件 (file)
+同时以别名/常量形式再导出 cleanenv 的既有面：`Setter`、`Updater`、`DefaultSeparator`、`TagEnv`、`TagEnvDefault`、`TagEnvUpd`、`TagEnvRequired`、`TagEnvSeparator`、`TagEnvLayout`、`TagEnvPrefix`、`TagEnvDescription`，以及 `ParseYAML` / `ParseJSON` / `ParseTOML`。
 
-```go
-import "github.com/soyacen/gonfig/resource/file"
+## 从 cleanenv 迁移
 
-resource, err := file.New("/path/to/config.json")
+| cleanenv | cleannacos |
+| --- | --- |
+| `cleanenv.ReadConfig("config.yaml", &cfg)` | `cleannacos.ReadConfig(ctx, dsn, &cfg)` |
+| `cleanenv.ReadEnv(&cfg)` | `cleannacos.ReadEnv(&cfg)` |
+| `cleanenv.UpdateEnv(&cfg)` | `cleannacos.UpdateEnv(&cfg)` |
+| `cleanenv.GetDescription(&cfg, nil)` | `cleannacos.GetDescription(&cfg, nil)` |
+| `cleanenv.Usage(&cfg, nil)` | `cleannacos.Usage(&cfg, nil)` |
+| — | `cleannacos.Watch[T](ctx, dsn, notify)` |
+
+除了 `import` 路径和 `ReadConfig` 的参数（文件路径 → 上下文 + DSN），struct tag、默认值、环境变量覆盖行为都不需要调整。本地文件读取继续使用 upstream cleanenv，本库不提供 `file://`。
+
+## 开发
+
+```bash
+make all                 # fmt-check + vet + test
+make test                # 单元测试
+make race                # 单元测试（-race）
+make lint                # fmt-check + vet + golangci-lint
+make tidy                # go mod tidy
+
+# 集成测试：需要可用的 Nacos，未设置环境变量则自动跳过
+CLEANNACOS_TEST_ADDR=127.0.0.1:8848 make integration-test
 ```
 
-### 3. Consul
+集成测试支持的环境变量：
 
-```go
-import "github.com/soyacen/gonfig/resource/consul"
+| 变量 | 必填 | 说明 |
+| --- | --- | --- |
+| `CLEANNACOS_TEST_ADDR` | 是 | Nacos 地址，格式 `host:port`；未设置则跳过全部集成测试 |
+| `CLEANNACOS_TEST_USERNAME` | 否 | 开启鉴权时的用户名 |
+| `CLEANNACOS_TEST_PASSWORD` | 否 | 开启鉴权时的密码 |
 
-client, _ := api.NewClient(api.DefaultConfig())
-resource, err := consul.New(client, "config/key")
-```
+## 已知限制
 
-### 4. Nacos
-
-支持通过 DSN 方式创建 Nacos 配置资源：
-
-```go
-import "github.com/soyacen/gonfig/resource/nacos"
-
-// 使用 DSN 创建资源
-// 格式：nacos://username:password@ip:port/dataId.ext?namespace=ns&group=g&param1=value1
-factory := nacos.Factory{}
-resource, err := factory.New(context.Background(), "nacos://admin:nacos@127.0.0.1:8848/config.yaml?namespace=test&group=MY_GROUP")
-
-// 或者使用传统方式
-resource, err := nacos.New(client, "group", "dataId")
-```
-
-#### Nacos DSN 参数说明：
-
-- `username:password` - 可选的认证信息
-- `ip:port` - Nacos 服务器地址和端口（默认端口 8848）
-- `dataId.ext` - 配置的数据ID和文件扩展名（必填）
-- `namespace` - 命名空间（可选，默认为 "public"）
-- `group` - 配置分组（可选，默认为 "DEFAULT_GROUP"）
-- 其他参数如 `timeoutMs`、`logDir`、`cacheDir` 等也可通过 query 参数传递
-
-## 支持的配置格式
-
-- **JSON**: `.json` 文件扩展名
-- **YAML**: `.yaml` 或 `.yml` 文件扩展名
-- **TOML**: `.toml` 文件扩展名
-- **ENV**: 环境变量格式（键值对）
-
-## Protobuf 消息命名约定
-
-代码生成器通过检查 Protobuf 消息的名称来决定是否为其生成配置管理代码。只要消息名称是 `Config`、`Conf` 或 `Configuration` 之一，就会自动生成相应的配置管理代码。
-
-不需要使用任何特殊的注解或选项。
-
-这会生成以下辅助函数：
-
-- [GetConfig()](file:///home/soyacen/Workspace/github.com/soyacen/gonfig/cmd/protoc-gen-gonfig/gen/generator.go#L87-L89) - 获取当前配置实例
-- [LoadConfig()](file:///home/soyacen/Workspace/github.com/soyacen/gonfig/cmd/protoc-gen-gonfig/gen/generator.go#L95-L97) - 从资源加载配置
-- [WatchConfig()](file:///home/soyacen/Workspace/github.com/soyacen/gonfig/cmd/protoc-gen-gonfig/gen/generator.go#L99-L101) - 监听配置变化
-- `GetFieldName()` - 直接获取字段值的函数（例如 `GetAddr()`、`GetPort()`）
-
-## 生成的代码结构
-
-代码生成器会为每个匹配的消息名称（`Config`、`Conf` 或 `Configuration`）生成以下内容：
-
-1. 一个全局变量存储配置（使用 `sync/atomic.Value` 类型）
-2. `init()` 函数初始化全局配置变量
-3. [LoadConfig()](file:///home/soyacen/Workspace/github.com/soyacen/gonfig/cmd/protoc-gen-gonfig/gen/generator.go#L95-L97) 函数用于从指定资源加载配置
-4. [WatchConfig()](file:///home/soyacen/Workspace/github.com/soyacen/gonfig/cmd/protoc-gen-gonfig/gen/generator.go#L99-L101) 函数用于监听配置变化
-5. [GetConfig()](file:///home/soyacen/Workspace/github.com/soyacen/gonfig/cmd/protoc-gen-gonfig/gen/generator.go#L87-L89) 函数用于获取当前配置的副本
-6. 每个字段的独立获取函数（如 `GetAddr()`、`GetPort()` 等）
-
-## 注意事项
-
-- Protobuf 消息名称必须是 `Config`、`Conf` 或 `Configuration` 之一才能被识别并生成代码
-- 不支持 `oneof` 字段类型
-- 所有生成的函数都是线程安全的
-- 使用 `google.golang.org/protobuf/proto.Clone` 来确保配置的深拷贝
-- 代码生成完全基于消息名称，不依赖任何 Protobuf 注解
+- 只有 `nacos://` 单一主机 DSN，不支持多地址集群列表，也不提供 `file://`（本地文件继续用 upstream cleanenv）。
+- `Watch` 的 `T` 需要是 cleanenv 能解析的类型（通常是 struct）。
+- 依赖的 nacos-sdk-go v2.3.5 在 `RpcClient.Shutdown` 中删除全局 client map 时没有加锁，而 `CreateClient` 读取该 map 时加锁，因此**在 `-race` 构建下**，「监听中关闭客户端」（即 `StopFunc` / 取消 `Watch` 的 ctx）可能报告一条发生在 SDK 内部的 data race，堆栈落在 `nacos-sdk-go` 的 `RpcClient.Shutdown` 与 `CreateClient` 上。这是上游缺陷，本库无法在自身代码里消除；单元测试仍然全程开启 `-race`，集成测试与 CI 的集成 job 因此不启用 `-race`。
 
 ## 许可证
 
-MIT License
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request 来改进这个项目。
+MIT License，见 [LICENSE](LICENSE)。

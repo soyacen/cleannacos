@@ -1,0 +1,87 @@
+name: Test
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          files="$(gofmt -l $(find $(go list -f '{{.Dir}}' ./...) -maxdepth 1 -name '*.go'))"
+          if [ -n "$files" ]; then
+            echo "gofmt is required for:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with the race detector
+        run: go test -race ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  integration:
+    name: Integration tests (Nacos)
+    runs-on: ubuntu-latest
+
+    services:
+      nacos:
+        image: nacos/nacos-server:v2.5.2
+        env:
+          MODE: standalone
+          NACOS_AUTH_ENABLE: "false"
+        ports:
+          - 8848:8848
+          - 9848:9848
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Wait for Nacos
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8848/nacos/v1/console/health/readiness > /dev/null; then
+              echo "Nacos is ready"
+              exit 0
+            fi
+            echo "Waiting for Nacos ($i/60)..."
+            sleep 5
+          done
+          echo "Nacos did not become ready in time"
+          exit 1
+
+      - name: Integration tests
+        # -race is intentionally left out: nacos-sdk-go v2.3.5 reports a race of
+        # its own in RpcClient.Shutdown when a config client is closed while
+        # listening. Unit tests keep the race detector enabled.
+        env:
+          CLEANNACOS_TEST_ADDR: 127.0.0.1:8848
+        run: go test -v -run Integration ./...

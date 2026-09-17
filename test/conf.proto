@@ -1,9 +1,0 @@
-syntax = "proto3";
-package config.test;
-
-option go_package = "github.com/soyacen/gonfig/test;test";
-
-message Config {
-  string field1 = 1;
-  string field2 = 2;
-}
