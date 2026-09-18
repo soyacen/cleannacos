@@ -3,19 +3,36 @@ package cleannacos
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
-const watchDSN = "nacos://127.0.0.1:8848/watch.yaml"
+const watchDSN = "nacos://127.0.0.1:8848"
 
+// watchConfig is watched from two dataIds.
 type watchConfig struct {
-	Host string `yaml:"host" env:"CLEANNACOS_TEST_WATCH_HOST" env-default:"fallback"`
+	Server struct {
+		Addr string `yaml:"addr" nacos-default:"server-fallback"`
+	} `nacos-data-id:"server.yaml"`
+
+	Database struct {
+		Host string `yaml:"host" nacos-default:"db-fallback"`
+	} `nacos-data-id:"db.yaml"`
+}
+
+// newWatchFake returns a fake client with a baseline for both sources.
+func newWatchFake() *fakeClient {
+	fake := newFakeClient()
+	fake.setContent("server.yaml", "addr: base\n")
+	fake.setContent("db.yaml", "host: db-base\n")
+
+	return fake
 }
 
 func TestWatchDeliversBaselineSynchronously(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	notifications := make(chan *watchConfig, 8)
@@ -29,16 +46,16 @@ func TestWatchDeliversBaselineSynchronously(t *testing.T) {
 
 	select {
 	case baseline := <-notifications:
-		if baseline.Host != "base" {
-			t.Fatalf("baseline Host = %q, want %q", baseline.Host, "base")
+		if baseline.Server.Addr != "base" || baseline.Database.Host != "db-base" {
+			t.Fatalf("baseline = %+v, want both sources merged", baseline)
 		}
 	default:
 		t.Fatal("baseline was not delivered synchronously by Watch")
 	}
 }
 
-func TestWatchRegistersListenerBeforeFetching(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+func TestWatchRegistersListenersBeforeFetching(t *testing.T) {
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	stop, err := Watch(context.Background(), watchDSN, func(*watchConfig) {})
@@ -48,19 +65,22 @@ func TestWatchRegistersListenerBeforeFetching(t *testing.T) {
 	defer func() { _ = stop(context.Background()) }()
 
 	calls := fake.callOrder()
-	if len(calls) < 2 {
-		t.Fatalf("client calls = %v, want a listen and a get call", calls)
+	if len(calls) != 4 {
+		t.Fatalf("client calls = %v, want two listen and two get calls", calls)
 	}
-	if calls[0] != "listen" || calls[1] != "get" {
-		t.Fatalf("client calls = %v, want the listener registered before the first fetch", calls)
+	for i, want := range []string{"listen", "listen", "get", "get"} {
+		if calls[i] != want {
+			t.Fatalf("client calls = %v, want listeners registered before the first fetch", calls)
+		}
 	}
-	if fake.lastListen.DataId != "watch.yaml" || fake.lastListen.Group != defaultGroup {
-		t.Fatalf("listener param = %+v, want the DSN dataId and default group", fake.lastListen)
+
+	if got, want := fake.listenDataIDs(), []string{"db.yaml", "server.yaml"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("listeners = %v, want %v", got, want)
 	}
 }
 
 func TestWatchNotifiesOnChange(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	notifications := make(chan *watchConfig, 8)
@@ -74,25 +94,56 @@ func TestWatchNotifiesOnChange(t *testing.T) {
 
 	baseline := waitForNotification(t, notifications, 5*time.Second)
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		fake.trigger("host: changed\n")
-	}()
+	if !fake.trigger("db.yaml", "host: db-changed\n") {
+		t.Fatal("no listener was registered for db.yaml")
+	}
 
 	updated := waitForNotification(t, notifications, 5*time.Second)
-	<-done
-
-	if updated.Host != "changed" {
-		t.Fatalf("updated Host = %q, want %q", updated.Host, "changed")
+	if updated.Database.Host != "db-changed" {
+		t.Fatalf("updated Database.Host = %q, want %q", updated.Database.Host, "db-changed")
+	}
+	if updated.Server.Addr != "base" {
+		t.Fatalf("updated Server.Addr = %q, want the unchanged source to survive", updated.Server.Addr)
 	}
 	if updated == baseline {
 		t.Fatal("Watch reused the baseline object instead of building a new one")
 	}
 }
 
+func TestWatchNotifiesOnScopedSource(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContentIn("dev", "APP", "app.yaml", "addr: base\n")
+	installFakeClient(t, fake)
+
+	type scopedConfig struct {
+		Server struct {
+			Addr string `yaml:"addr"`
+		} `nacos-data-id:"app.yaml" nacos-group:"APP" nacos-namespace:"dev"`
+	}
+
+	notifications := make(chan *scopedConfig, 8)
+	stop, err := Watch(context.Background(), watchDSN, func(conf *scopedConfig) {
+		notifications <- conf
+	})
+	if err != nil {
+		t.Fatalf("Watch() error = %v", err)
+	}
+	defer func() { _ = stop(context.Background()) }()
+
+	if baseline := waitForNotification(t, notifications, 5*time.Second); baseline.Server.Addr != "base" {
+		t.Fatalf("baseline Server.Addr = %q, want %q", baseline.Server.Addr, "base")
+	}
+
+	if !fake.triggerIn("dev", "APP", "app.yaml", "addr: changed\n") {
+		t.Fatal("no listener was registered for the scoped source")
+	}
+	if updated := waitForNotification(t, notifications, 5*time.Second); updated.Server.Addr != "changed" {
+		t.Fatalf("updated Server.Addr = %q, want %q", updated.Server.Addr, "changed")
+	}
+}
+
 func TestWatchDedupesIdenticalContent(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	notifications := make(chan *watchConfig, 8)
@@ -106,14 +157,14 @@ func TestWatchDedupesIdenticalContent(t *testing.T) {
 
 	waitForNotification(t, notifications, 5*time.Second)
 
-	if !fake.trigger("host: base\n") {
+	if !fake.trigger("server.yaml", "addr: base\n") {
 		t.Fatal("no listener was registered")
 	}
 	assertNoNotification(t, notifications, 300*time.Millisecond)
 }
 
 func TestWatchBadContentKeepsBaseline(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	notifications := make(chan *watchConfig, 8)
@@ -131,7 +182,7 @@ func TestWatchBadContentKeepsBaseline(t *testing.T) {
 
 	waitForNotification(t, notifications, 5*time.Second)
 
-	fake.trigger("host: [broken\n")
+	fake.trigger("server.yaml", "addr: [broken\n")
 
 	select {
 	case err := <-failures:
@@ -144,12 +195,12 @@ func TestWatchBadContentKeepsBaseline(t *testing.T) {
 	assertNoNotification(t, notifications, 200*time.Millisecond)
 
 	// Reverting to the last good content is not a change.
-	fake.trigger("host: base\n")
+	fake.trigger("server.yaml", "addr: base\n")
 	assertNoNotification(t, notifications, 300*time.Millisecond)
 }
 
 func TestWatchStopIsIdempotent(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	stop, err := Watch(context.Background(), watchDSN, func(*watchConfig) {})
@@ -164,19 +215,19 @@ func TestWatchStopIsIdempotent(t *testing.T) {
 		t.Fatalf("second stop() error = %v, want nil", err)
 	}
 
-	if count := fake.countCalls("cancel"); count != 1 {
-		t.Errorf("cancel calls = %d, want 1", count)
+	if got, want := fake.cancelDataIDs(), []string{"db.yaml", "server.yaml"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("cancelled dataIds = %v, want %v", got, want)
 	}
 	if count := fake.countCalls("close"); count != 1 {
 		t.Errorf("close calls = %d, want 1", count)
 	}
 	if fake.hasListener() {
-		t.Error("listener is still registered after stop")
+		t.Error("listeners are still registered after stop")
 	}
 }
 
 func TestWatchContextCancelStopsQuietly(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	notifications := make(chan *watchConfig, 8)
@@ -198,7 +249,7 @@ func TestWatchContextCancelStopsQuietly(t *testing.T) {
 	waitForCondition(t, 5*time.Second, fake.isClosed)
 
 	if fake.hasListener() {
-		t.Error("listener is still registered after the context was cancelled")
+		t.Error("listeners are still registered after the context was cancelled")
 	}
 	select {
 	case err := <-failures:
@@ -219,7 +270,7 @@ func TestWatchBaselineFailuresCleanUp(t *testing.T) {
 		{
 			name: "provider error",
 			fake: func() *fakeClient {
-				fake := newFakeClient("")
+				fake := newWatchFake()
 				fake.getErr = errors.New("boom")
 
 				return fake
@@ -227,8 +278,13 @@ func TestWatchBaselineFailuresCleanUp(t *testing.T) {
 			wantMsg: "boom",
 		},
 		{
-			name:    "unparsable content",
-			fake:    newFakeClient("host: [broken\n"),
+			name: "unparsable content",
+			fake: func() *fakeClient {
+				fake := newWatchFake()
+				fake.setContent("server.yaml", "addr: [broken\n")
+
+				return fake
+			}(),
 			wantMsg: "cleannacos: parse",
 		},
 	}
@@ -250,15 +306,15 @@ func TestWatchBaselineFailuresCleanUp(t *testing.T) {
 			if !tt.fake.isClosed() {
 				t.Error("Watch() did not close the client after a failed startup")
 			}
-			if count := tt.fake.countCalls("cancel"); count != 1 {
-				t.Errorf("cancel calls = %d, want 1", count)
+			if got, want := tt.fake.cancelDataIDs(), []string{"db.yaml", "server.yaml"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("cancelled dataIds = %v, want %v", got, want)
 			}
 		})
 	}
 }
 
 func TestWatchRejectsNilNotify(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	stop, err := Watch[watchConfig](context.Background(), watchDSN, nil)
@@ -274,7 +330,7 @@ func TestWatchRejectsNilNotify(t *testing.T) {
 }
 
 func TestWatchRejectsCancelledContext(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	installFakeClient(t, fake)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -289,8 +345,21 @@ func TestWatchRejectsCancelledContext(t *testing.T) {
 	}
 }
 
+func TestWatchRejectsNonStruct(t *testing.T) {
+	fake := newWatchFake()
+	installFakeClient(t, fake)
+
+	_, err := Watch(context.Background(), watchDSN, func(*string) {})
+	if err == nil {
+		t.Fatal("Watch() = nil, want error")
+	}
+	if len(fake.callOrder()) != 0 {
+		t.Fatalf("client calls = %v, want none", fake.callOrder())
+	}
+}
+
 func TestWatchStopReportsCancelError(t *testing.T) {
-	fake := newFakeClient("host: base\n")
+	fake := newWatchFake()
 	fake.cancelErr = errors.New("cancel failed")
 	installFakeClient(t, fake)
 

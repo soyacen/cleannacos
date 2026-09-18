@@ -11,7 +11,8 @@ import (
 const (
 	// defaultPort is the Nacos server port used when the DSN omits one.
 	defaultPort = 8848
-	// defaultGroup is the Nacos group used when the DSN omits one.
+	// defaultGroup is the Nacos group used when neither the DSN nor a
+	// nacos-group tag provides one.
 	defaultGroup = "DEFAULT_GROUP"
 	// defaultLogDir is where the Nacos SDK writes its log files.
 	defaultLogDir = "/tmp/nacos/log"
@@ -21,22 +22,23 @@ const (
 
 // dsn holds the structured parameters of a nacos:// DSN.
 //
+// A DSN only describes the Nacos server and the defaults of the connection.
+// Which configs are read is declared by the nacos-data-id struct tag, so the
+// DSN path must stay empty.
+//
 // Optional SDK settings are pointers so that "not set" can be told apart from
 // "explicitly set to the zero value"; only the settings that were provided are
 // forwarded to the Nacos SDK.
 type dsn struct {
 	host      string
 	port      uint64
-	dataID    string
 	namespace string
 	group     string
 	username  string
 	password  string
-	format    format
 
-	logDir     string
-	cacheDir   string
-	allowEmpty bool
+	logDir   string
+	cacheDir string
 
 	timeoutMs           *uint64
 	logLevel            *string
@@ -46,10 +48,11 @@ type dsn struct {
 
 // parseDSN parses a nacos:// DSN into structured connection parameters.
 //
-//	nacos://user:pass@host:8848/dataId.yaml?namespace=ns&group=g&timeoutMs=5000
+//	nacos://user:pass@host:8848?namespace=ns&group=g&timeoutMs=5000
 //
-// The path only carries the dataId, whose extension selects the parser. Only
-// single host DSNs are supported; unknown query parameters are ignored.
+// The path must be empty: dataIds belong to the config structure, not to the
+// DSN. Only single host DSNs are supported; unknown query parameters are
+// ignored.
 func parseDSN(raw string) (*dsn, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -61,15 +64,17 @@ func parseDSN(raw string) (*dsn, error) {
 	if u.Hostname() == "" {
 		return nil, fmt.Errorf("cleannacos: dsn %q has no host", raw)
 	}
+	if path := strings.Trim(u.Path, "/"); path != "" {
+		return nil, fmt.Errorf("cleannacos: dsn %q must not carry a path, the dataId is declared with the %q struct tag", raw, TagNacosDataID)
+	}
 
 	d := &dsn{
-		host:       u.Hostname(),
-		port:       defaultPort,
-		namespace:  "",
-		group:      defaultGroup,
-		logDir:     defaultLogDir,
-		cacheDir:   defaultCacheDir,
-		allowEmpty: false,
+		host:      u.Hostname(),
+		port:      defaultPort,
+		namespace: "",
+		group:     defaultGroup,
+		logDir:    defaultLogDir,
+		cacheDir:  defaultCacheDir,
 	}
 
 	if port := u.Port(); port != "" {
@@ -78,14 +83,6 @@ func parseDSN(raw string) (*dsn, error) {
 			return nil, fmt.Errorf("cleannacos: invalid port %q in dsn %q: %w", port, raw, err)
 		}
 		d.port = value
-	}
-
-	d.dataID = strings.TrimPrefix(u.Path, "/")
-	if d.dataID == "" {
-		return nil, fmt.Errorf("cleannacos: dsn %q has no dataId in the path", raw)
-	}
-	if d.format, err = resolveFormat(d.dataID); err != nil {
-		return nil, err
 	}
 
 	if u.User != nil {
@@ -128,18 +125,11 @@ func parseDSN(raw string) (*dsn, error) {
 		}
 		d.notLoadCacheAtStart = &value
 	}
-	if v := query.Get("allowEmpty"); v != "" {
-		value, err := strconv.ParseBool(v)
-		if err != nil {
-			return nil, fmt.Errorf("cleannacos: invalid allowEmpty %q in dsn %q: %w", v, raw, err)
-		}
-		d.allowEmpty = value
-	}
 
 	return d, nil
 }
 
-// ident describes the target config for error messages.
-func (d *dsn) ident() string {
-	return fmt.Sprintf("config %q (group %q, namespace %q)", d.dataID, d.group, d.namespace)
+// serverIdent describes the Nacos server for DSN level error messages.
+func (d *dsn) serverIdent() string {
+	return fmt.Sprintf("server %s:%d (group %q, namespace %q)", d.host, d.port, d.group, d.namespace)
 }

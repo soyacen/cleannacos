@@ -15,16 +15,23 @@ import (
 	"github.com/soyacen/cleannacos"
 )
 
-// Config is the watched configuration structure.
+// Config is the watched configuration structure. The dataIds of every watched
+// Nacos config are declared by struct tags.
 type Config struct {
-	Addr  string `yaml:"addr" env:"ADDR" env-default:"localhost:8080" env-description:"listen address"`
-	Debug bool   `yaml:"debug" env:"DEBUG" env-default:"false" env-description:"enable debug logging"`
+	Server struct {
+		Addr  string `yaml:"addr" nacos-default:"localhost:8080" nacos-description:"listen address"`
+		Debug bool   `yaml:"debug" nacos-default:"false" nacos-description:"enable debug logging"`
+	} `nacos-data-id:"server.yaml"`
+
+	Redis struct {
+		Addr string `yaml:"addr" nacos-default:"127.0.0.1:6379" nacos-description:"redis address"`
+	} `nacos-data-id:"redis.yaml"`
 }
 
 func main() {
 	dsn := os.Getenv("CLEANNACOS_DSN")
 	if dsn == "" {
-		dsn = "nacos://127.0.0.1:8848/config.yaml?group=DEFAULT_GROUP"
+		dsn = "nacos://127.0.0.1:8848?group=DEFAULT_GROUP"
 	}
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

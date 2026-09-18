@@ -15,11 +15,9 @@ func baseDSN() *dsn {
 	return &dsn{
 		host:     "127.0.0.1",
 		port:     defaultPort,
-		dataID:   "config.yaml",
 		group:    defaultGroup,
 		logDir:   defaultLogDir,
 		cacheDir: defaultCacheDir,
-		format:   formatYAML,
 	}
 }
 
@@ -32,22 +30,21 @@ func TestParseDSN(t *testing.T) {
 	}{
 		{
 			name: "minimal dsn uses defaults",
-			raw:  "nacos://127.0.0.1/config.yaml",
+			raw:  "nacos://127.0.0.1",
 			want: baseDSN(),
 		},
 		{
 			name: "namespace defaults to the public namespace",
-			raw:  "nacos://127.0.0.1:8848/config.yaml",
+			raw:  "nacos://127.0.0.1:8848",
 			want: baseDSN(),
 		},
 		{
 			name: "every query parameter is applied",
-			raw:  "nacos://10.0.0.1:8849/app.yml?namespace=dev&group=APP&timeoutMs=5000&logDir=/tmp/log&cacheDir=/tmp/cache&logLevel=debug&notLoadCacheAtStart=true&appName=my-app&allowEmpty=true",
+			raw:  "nacos://10.0.0.1:8849?namespace=dev&group=APP&timeoutMs=5000&logDir=/tmp/log&cacheDir=/tmp/cache&logLevel=debug&notLoadCacheAtStart=true&appName=my-app",
 			want: func() *dsn {
 				want := baseDSN()
 				want.host = "10.0.0.1"
 				want.port = 8849
-				want.dataID = "app.yml"
 				want.namespace = "dev"
 				want.group = "APP"
 				want.logDir = "/tmp/log"
@@ -56,14 +53,13 @@ func TestParseDSN(t *testing.T) {
 				want.timeoutMs = ptrTo(uint64(5000))
 				want.notLoadCacheAtStart = ptrTo(true)
 				want.appName = ptrTo("my-app")
-				want.allowEmpty = true
 
 				return want
 			}(),
 		},
 		{
 			name: "username and password",
-			raw:  "nacos://admin:nacos@127.0.0.1:8848/config.yaml",
+			raw:  "nacos://admin:nacos@127.0.0.1:8848",
 			want: func() *dsn {
 				want := baseDSN()
 				want.username = "admin"
@@ -74,7 +70,7 @@ func TestParseDSN(t *testing.T) {
 		},
 		{
 			name: "username without password",
-			raw:  "nacos://admin@127.0.0.1:8848/config.yaml",
+			raw:  "nacos://admin@127.0.0.1:8848",
 			want: func() *dsn {
 				want := baseDSN()
 				want.username = "admin"
@@ -83,81 +79,19 @@ func TestParseDSN(t *testing.T) {
 			}(),
 		},
 		{
-			name: "dataId keeps its slashes",
-			raw:  "nacos://127.0.0.1:8848/group/app.json",
-			want: func() *dsn {
-				want := baseDSN()
-				want.dataID = "group/app.json"
-				want.format = formatJSON
-
-				return want
-			}(),
-		},
-		{
-			name: "extension case is ignored",
-			raw:  "nacos://127.0.0.1:8848/APP.YAML",
-			want: func() *dsn {
-				want := baseDSN()
-				want.dataID = "APP.YAML"
-				want.format = formatYAML
-
-				return want
-			}(),
-		},
-		{
-			name: "toml extension",
-			raw:  "nacos://127.0.0.1:8848/app.toml",
-			want: func() *dsn {
-				want := baseDSN()
-				want.dataID = "app.toml"
-				want.format = formatTOML
-
-				return want
-			}(),
-		},
-		{
-			name: "env extension",
-			raw:  "nacos://127.0.0.1:8848/app.env",
-			want: func() *dsn {
-				want := baseDSN()
-				want.dataID = "app.env"
-				want.format = formatENV
-
-				return want
-			}(),
-		},
-		{
-			name: "edn extension",
-			raw:  "nacos://127.0.0.1:8848/app.edn",
-			want: func() *dsn {
-				want := baseDSN()
-				want.dataID = "app.edn"
-				want.format = formatEDN
-
-				return want
-			}(),
-		},
-		{
 			name: "unknown query parameters are ignored",
-			raw:  "nacos://127.0.0.1:8848/config.yaml?foo=bar&allowEmpty=true",
-			want: func() *dsn {
-				want := baseDSN()
-				want.allowEmpty = true
-
-				return want
-			}(),
+			raw:  "nacos://127.0.0.1:8848?foo=bar",
+			want: baseDSN(),
 		},
 		{name: "empty dsn", raw: "", wantErr: true},
-		{name: "unsupported scheme", raw: "http://127.0.0.1:8848/config.yaml", wantErr: true},
-		{name: "missing host", raw: "nacos:///config.yaml", wantErr: true},
-		{name: "missing dataId", raw: "nacos://127.0.0.1:8848/", wantErr: true},
-		{name: "missing extension", raw: "nacos://127.0.0.1:8848/config", wantErr: true},
-		{name: "unknown extension", raw: "nacos://127.0.0.1:8848/config.txt", wantErr: true},
-		{name: "non numeric port", raw: "nacos://127.0.0.1:port/config.yaml", wantErr: true},
-		{name: "out of range port", raw: "nacos://127.0.0.1:99999999999999999999/config.yaml", wantErr: true},
-		{name: "invalid timeoutMs", raw: "nacos://127.0.0.1:8848/config.yaml?timeoutMs=abc", wantErr: true},
-		{name: "invalid notLoadCacheAtStart", raw: "nacos://127.0.0.1:8848/config.yaml?notLoadCacheAtStart=yes", wantErr: true},
-		{name: "invalid allowEmpty", raw: "nacos://127.0.0.1:8848/config.yaml?allowEmpty=maybe", wantErr: true},
+		{name: "unsupported scheme", raw: "http://127.0.0.1:8848", wantErr: true},
+		{name: "missing host", raw: "nacos:///", wantErr: true},
+		{name: "dataId in the path", raw: "nacos://127.0.0.1:8848/config.yaml", wantErr: true},
+		{name: "dataId in a nested path", raw: "nacos://127.0.0.1:8848/group/app.yaml", wantErr: true},
+		{name: "non numeric port", raw: "nacos://127.0.0.1:port", wantErr: true},
+		{name: "out of range port", raw: "nacos://127.0.0.1:99999999999999999999", wantErr: true},
+		{name: "invalid timeoutMs", raw: "nacos://127.0.0.1:8848?timeoutMs=abc", wantErr: true},
+		{name: "invalid notLoadCacheAtStart", raw: "nacos://127.0.0.1:8848?notLoadCacheAtStart=yes", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -184,11 +118,40 @@ func TestParseDSN(t *testing.T) {
 	}
 }
 
-func TestDSNIdent(t *testing.T) {
-	d := &dsn{dataID: "app.yaml", group: "APP", namespace: "dev"}
+func TestParseDSNRejectsPath(t *testing.T) {
+	_, err := parseDSN("nacos://127.0.0.1:8848/app.yaml")
+	if err == nil {
+		t.Fatal("parseDSN() = nil, want error")
+	}
+	if !strings.Contains(err.Error(), TagNacosDataID) {
+		t.Fatalf("parseDSN() error = %q, want it to point at the %s tag", err, TagNacosDataID)
+	}
+}
+
+func TestParseDSNIgnoresAllowEmpty(t *testing.T) {
+	d, err := parseDSN("nacos://127.0.0.1:8848?allowEmpty=maybe")
+	if err != nil {
+		t.Fatalf("parseDSN() error = %v, want the removed allowEmpty parameter to be ignored", err)
+	}
+	if !reflect.DeepEqual(d, baseDSN()) {
+		t.Fatalf("parseDSN() = %+v, want %+v", d, baseDSN())
+	}
+}
+
+func TestServerIdent(t *testing.T) {
+	d := &dsn{host: "127.0.0.1", port: 8848, group: "APP", namespace: "dev"}
+
+	want := `server 127.0.0.1:8848 (group "APP", namespace "dev")`
+	if got := d.serverIdent(); got != want {
+		t.Fatalf("serverIdent() = %q, want %q", got, want)
+	}
+}
+
+func TestSourceIdent(t *testing.T) {
+	src := source{dataID: "app.yaml", group: "APP", namespace: "dev"}
 
 	want := `config "app.yaml" (group "APP", namespace "dev")`
-	if got := d.ident(); got != want {
+	if got := src.ident(); got != want {
 		t.Fatalf("ident() = %q, want %q", got, want)
 	}
 }

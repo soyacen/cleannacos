@@ -5,9 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sync"
-
-	"github.com/nacos-group/nacos-sdk-go/v2/vo"
 )
 
 // StopFunc stops a running watch. It is safe to call more than once.
@@ -34,14 +33,17 @@ func WithErrorHandler(errFunc ErrFunc) WatchOption {
 	}
 }
 
-// Watch listens for changes of the Nacos config addressed by dsn and hands a
-// freshly merged *T to notify.
+// Watch listens for changes of every Nacos config declared by the struct tags
+// of T and hands a freshly merged *T to notify.
 //
-// The Nacos listener is registered first, then the current content is fetched
-// and delivered synchronously as the baseline snapshot, so notify has returned
-// at least once when Watch returns. Later changes are delivered asynchronously
-// with one new *T per change; notify calls are serialized internally, so the
-// callback can simply swap an atomic pointer.
+// The listeners are registered first, then the current content of every source
+// is fetched and delivered synchronously as the baseline snapshot, so notify
+// has returned at least once when Watch returns. Later changes are delivered
+// asynchronously with one new *T per change; notify calls are serialized
+// internally, so the callback can simply swap an atomic pointer.
+//
+// A change that cannot be parsed keeps the previous snapshot and is reported to
+// the error handler only.
 func Watch[T any](ctx context.Context, dsn string, notify func(conf *T), options ...WatchOption) (StopFunc, error) {
 	if notify == nil {
 		return nil, errors.New("cleannacos: notify func is nil")
@@ -52,31 +54,37 @@ func Watch[T any](ctx context.Context, dsn string, notify func(conf *T), options
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("cleannacos: %s: %w", d.ident(), err)
+		return nil, fmt.Errorf("cleannacos: %s: %w", d.serverIdent(), err)
 	}
 
-	opts := watchOptions{onError: defaultErrorHandler(d)}
+	conf := new(T)
+	if reflect.TypeOf(conf).Elem().Kind() != reflect.Struct {
+		return nil, fmt.Errorf("cleannacos: cfg must be a struct, got %T", conf)
+	}
+
+	schema, err := buildSchema(conf, d)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := watchOptions{onError: defaultErrorHandler()}
 	for _, option := range options {
 		if option != nil {
 			option(&opts)
 		}
 	}
 
-	client, err := newClient(d)
-	if err != nil {
-		return nil, err
-	}
-
 	w := &watcher[T]{
-		client:  client,
-		dsn:     d,
-		notify:  notify,
-		onError: opts.onError,
-		done:    make(chan struct{}),
+		pool:     newClientPool(d),
+		schema:   schema,
+		notify:   notify,
+		onError:  opts.onError,
+		contents: make(map[string]string, len(schema.sources)),
+		done:     make(chan struct{}),
 	}
 
 	if err := w.start(ctx); err != nil {
-		// Neither the listener nor the client may outlive a failed startup.
+		// Neither the listeners nor the clients may outlive a failed startup.
 		_ = w.stop(context.Background())
 		return nil, err
 	}
@@ -84,26 +92,35 @@ func Watch[T any](ctx context.Context, dsn string, notify func(conf *T), options
 	return w.stop, nil
 }
 
-// watcher fetches config content, remembers the last content that was parsed
+// watcher fetches every source, remembers the last content that was parsed
 // successfully and serializes the notifications to the caller.
 type watcher[T any] struct {
-	client  configClient
-	dsn     *dsn
+	pool    *clientPool
+	schema  *schema
 	notify  func(conf *T)
 	onError ErrFunc
 
-	mu          sync.Mutex
-	lastContent string
+	mu       sync.Mutex
+	contents map[string]string
 
 	once    sync.Once
 	stopErr error
 	done    chan struct{}
 }
 
-// start registers the listener and delivers the baseline snapshot.
+// start registers the listeners and delivers the baseline snapshot.
 func (w *watcher[T]) start(ctx context.Context) error {
-	if err := w.client.ListenConfig(w.listenParam()); err != nil {
-		return fmt.Errorf("cleannacos: listen %s: %w", w.dsn.ident(), err)
+	for _, src := range w.schema.sources {
+		client, err := w.pool.client(src.namespace)
+		if err != nil {
+			return err
+		}
+
+		param := src.configParam()
+		param.OnChange = w.onChange(src)
+		if err := client.ListenConfig(param); err != nil {
+			return fmt.Errorf("cleannacos: listen %s: %w", src.ident(), err)
+		}
 	}
 
 	go func() {
@@ -115,67 +132,84 @@ func (w *watcher[T]) start(ctx context.Context) error {
 		}
 	}()
 
-	content, err := fetch(w.client, w.dsn)
+	contents, err := fetchAll(w.pool, w.schema)
 	if err != nil {
 		return err
 	}
 
-	conf, err := w.build(content)
+	conf, err := build[T](w.schema, contents)
 	if err != nil {
 		return err
 	}
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.lastContent = content
+	w.contents = contents
 	w.notify(conf)
 
 	return nil
 }
 
-// onChange handles a Nacos config change event.
-func (w *watcher[T]) onChange(_, _, _, content string) {
-	w.mu.Lock()
+// onChange handles a Nacos config change event of one source.
+func (w *watcher[T]) onChange(src source) func(namespace, group, dataID, content string) {
+	return func(_, _, _, content string) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
 
-	if content == w.lastContent {
-		w.mu.Unlock()
-		return
+		if content == w.contents[src.key()] {
+			return
+		}
+
+		contents, err := fetchAll(w.pool, w.schema)
+		if err != nil {
+			w.onError(err)
+
+			return
+		}
+		if sameContents(w.contents, contents) {
+			return
+		}
+
+		conf, err := build[T](w.schema, contents)
+		if err != nil {
+			// Keep the previous good contents, so a later change back to them
+			// is not reported again.
+			w.onError(err)
+
+			return
+		}
+
+		w.contents = contents
+		w.notify(conf)
 	}
-
-	conf, err := w.build(content)
-	if err != nil {
-		w.mu.Unlock()
-		// Keep the previous good content as the baseline, so a later change
-		// back to it is not reported again.
-		w.onError(err)
-		return
-	}
-
-	w.lastContent = content
-	w.notify(conf)
-	w.mu.Unlock()
 }
 
-// build merges raw Nacos content into a fresh *T.
-func (w *watcher[T]) build(content string) (*T, error) {
+// build merges the contents of every source into a fresh *T.
+func build[T any](schema *schema, contents map[string]string) (*T, error) {
 	conf := new(T)
-	if err := merge(content, w.dsn, conf); err != nil {
+	if err := apply(schema, contents, reflect.ValueOf(conf).Elem()); err != nil {
 		return nil, err
 	}
 
 	return conf, nil
 }
 
-// listenParam builds the listener registration parameter.
-func (w *watcher[T]) listenParam() vo.ConfigParam {
-	param := w.dsn.configParam()
-	param.OnChange = w.onChange
+// sameContents reports whether both content maps are equal.
+func sameContents(left, right map[string]string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key, value := range left {
+		if right[key] != value {
+			return false
+		}
+	}
 
-	return param
+	return true
 }
 
-// stop cancels the listener and releases the client. Repeated calls are no-ops
-// returning the error of the first call.
+// stop cancels the listeners and releases the clients. Repeated calls are
+// no-ops returning the error of the first call.
 func (w *watcher[T]) stop(_ context.Context) error {
 	w.once.Do(func() {
 		w.stopErr = w.teardown()
@@ -184,34 +218,38 @@ func (w *watcher[T]) stop(_ context.Context) error {
 	return w.stopErr
 }
 
-// teardown cancels the listener and closes the client.
+// teardown cancels every listener and closes every client.
 //
 // Note for readers running with the race detector: nacos-sdk-go v2.3.5 has a
 // data race of its own in this path. RpcClient.Shutdown deletes the client from
 // the package level client map without holding cMux, while CreateClient reads
 // that map under cMux, so closing a client while the SDK listen loop is active
 // can be reported as a race between those two SDK frames. Cancelling the
-// listener first keeps the window small, but it cannot be closed from here.
+// listeners first keeps the window small, but it cannot be closed from here.
 func (w *watcher[T]) teardown() error {
 	var errs []error
 
-	if err := w.client.CancelListenConfig(w.dsn.configParam()); err != nil {
-		errs = append(errs, fmt.Errorf("cleannacos: cancel listen %s: %w", w.dsn.ident(), err))
+	for _, src := range w.schema.sources {
+		client, err := w.pool.client(src.namespace)
+		if err != nil {
+			errs = append(errs, err)
+
+			continue
+		}
+		if err := client.CancelListenConfig(src.configParam()); err != nil {
+			errs = append(errs, fmt.Errorf("cleannacos: cancel listen %s: %w", src.ident(), err))
+		}
 	}
-	closeClient(w.client)
+
+	w.pool.closeAll()
 	close(w.done)
 
 	return errors.Join(errs...)
 }
 
 // defaultErrorHandler logs watch errors to the default slog logger.
-func defaultErrorHandler(d *dsn) ErrFunc {
+func defaultErrorHandler() ErrFunc {
 	return func(err error) {
-		slog.Error("cleannacos: watch error",
-			slog.String("dataId", d.dataID),
-			slog.String("group", d.group),
-			slog.String("namespace", d.namespace),
-			slog.String("error", err.Error()),
-		)
+		slog.Error("cleannacos: watch error", slog.String("error", err.Error()))
 	}
 }

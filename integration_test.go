@@ -2,7 +2,6 @@ package cleannacos
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/url"
 	"os"
@@ -24,6 +23,14 @@ const (
 	testPasswordEnv = "CLEANNACOS_TEST_PASSWORD"
 	testGroup       = "CLEANNACOS"
 
+	// The dataIds are part of the struct tags, so unlike earlier versions they
+	// cannot be unique per run. Every test cleans up the configs it published.
+	integrationServerDataID  = "cleannacos-it-server.yaml"
+	integrationDBDataID      = "cleannacos-it-db.yaml"
+	integrationWatchDataID   = "cleannacos-it-watch.yaml"
+	integrationMissingDataID = "cleannacos-it-missing.yaml"
+	integrationInvalidDataID = "cleannacos-it-invalid.yaml"
+
 	// pushTimeout is how long a change may take to reach the client.
 	pushTimeout = 30 * time.Second
 )
@@ -36,9 +43,11 @@ type testNacos struct {
 	password string
 }
 
-// integrationWatchConfig is the config watched by TestIntegrationWatch.
+// integrationWatchConfig is the config watched by the watch integration tests.
 type integrationWatchConfig struct {
-	Host string `yaml:"host" env:"CLEANNACOS_TEST_IT_WATCH_HOST" env-default:"fallback"`
+	Server struct {
+		Host string `yaml:"host" nacos-default:"fallback"`
+	} `nacos-data-id:"cleannacos-it-watch.yaml"`
 }
 
 // newTestNacos skips the test unless CLEANNACOS_TEST_ADDR points to a server.
@@ -67,14 +76,14 @@ func newTestNacos(t *testing.T) testNacos {
 	}
 }
 
-// dsn builds a nacos:// DSN pointing at the test server.
-func (n testNacos) dsn(t *testing.T, dataID string, extra map[string]string) string {
+// dsn builds a nacos:// DSN pointing at the test server. The DSN carries no
+// dataId: those come from the struct tags.
+func (n testNacos) dsn(t *testing.T) string {
 	t.Helper()
 
 	endpoint := url.URL{
 		Scheme: "nacos",
 		Host:   net.JoinHostPort(n.host, strconv.FormatUint(n.port, 10)),
-		Path:   "/" + dataID,
 	}
 	if n.username != "" {
 		endpoint.User = url.UserPassword(n.username, n.password)
@@ -86,9 +95,6 @@ func (n testNacos) dsn(t *testing.T, dataID string, extra map[string]string) str
 	query.Set("cacheDir", filepath.Join(t.TempDir(), "cache"))
 	query.Set("logLevel", "error")
 	query.Set("notLoadCacheAtStart", "true")
-	for key, value := range extra {
-		query.Set(key, value)
-	}
 	endpoint.RawQuery = query.Encode()
 
 	return endpoint.String()
@@ -121,7 +127,7 @@ func (n testNacos) publisher(t *testing.T) config_client.IConfigClient {
 	return client
 }
 
-// publish writes content for a fresh dataId and deletes it after the test.
+// publish writes content for a dataId and deletes it after the test.
 func (n testNacos) publish(t *testing.T, client config_client.IConfigClient, dataID, content string) {
 	t.Helper()
 
@@ -135,50 +141,57 @@ func (n testNacos) publish(t *testing.T, client config_client.IConfigClient, dat
 	})
 }
 
-// testDataID returns a dataId that does not collide with other runs.
-func testDataID(t *testing.T, suffix string) string {
+// delete removes a test config without failing when it does not exist.
+func (n testNacos) delete(t *testing.T, client config_client.IConfigClient, dataID string) {
 	t.Helper()
 
-	return fmt.Sprintf("cleannacos-it-%d-%s", time.Now().UnixNano(), suffix)
+	if _, err := client.DeleteConfig(vo.ConfigParam{DataId: dataID, Group: testGroup}); err != nil {
+		t.Logf("delete %s: %v", dataID, err)
+	}
 }
 
 func TestIntegrationReadConfig(t *testing.T) {
 	n := newTestNacos(t)
 	client := n.publisher(t)
-	dataID := testDataID(t, "read.yaml")
-	n.publish(t, client, dataID, "host: from-nacos\nport: 1\n")
-
-	t.Setenv("CLEANNACOS_TEST_IT_HOST", "from-env")
+	n.publish(t, client, integrationServerDataID, "addr: 10.0.0.1:9090\n")
+	n.publish(t, client, integrationDBDataID, "host: db.internal\n")
 
 	var cfg struct {
-		Host string `yaml:"host" env:"CLEANNACOS_TEST_IT_HOST" env-default:"fallback"`
-		Port int    `yaml:"port" env:"CLEANNACOS_TEST_IT_PORT" env-default:"9"`
-		Tag  string `yaml:"tag" env:"CLEANNACOS_TEST_IT_TAG" env-default:"default-tag"`
+		Server struct {
+			Addr    string        `yaml:"addr" nacos-required:"true"`
+			Timeout time.Duration `yaml:"timeout" nacos-default:"5s"`
+		} `nacos-data-id:"cleannacos-it-server.yaml"`
+		Database struct {
+			Host string `yaml:"host" nacos-required:"true"`
+			Port int    `yaml:"port" nacos-default:"5432"`
+		} `nacos-data-id:"cleannacos-it-db.yaml"`
 	}
 
-	if err := ReadConfig(context.Background(), n.dsn(t, dataID, nil), &cfg); err != nil {
+	if err := ReadConfig(context.Background(), n.dsn(t), &cfg); err != nil {
 		t.Fatalf("ReadConfig() error = %v", err)
 	}
-	if cfg.Host != "from-env" {
-		t.Errorf("Host = %q, want %q", cfg.Host, "from-env")
+	if cfg.Server.Addr != "10.0.0.1:9090" {
+		t.Errorf("Server.Addr = %q, want %q", cfg.Server.Addr, "10.0.0.1:9090")
 	}
-	if cfg.Port != 1 {
-		t.Errorf("Port = %d, want 1", cfg.Port)
+	if cfg.Server.Timeout != 5*time.Second {
+		t.Errorf("Server.Timeout = %s, want 5s", cfg.Server.Timeout)
 	}
-	if cfg.Tag != "default-tag" {
-		t.Errorf("Tag = %q, want %q", cfg.Tag, "default-tag")
+	if cfg.Database.Host != "db.internal" {
+		t.Errorf("Database.Host = %q, want %q", cfg.Database.Host, "db.internal")
+	}
+	if cfg.Database.Port != 5432 {
+		t.Errorf("Database.Port = %d, want 5432", cfg.Database.Port)
 	}
 }
 
 func TestIntegrationWatch(t *testing.T) {
 	n := newTestNacos(t)
 	client := n.publisher(t)
-	dataID := testDataID(t, "watch.yaml")
-	n.publish(t, client, dataID, "host: base\n")
+	n.publish(t, client, integrationWatchDataID, "host: base\n")
 
 	notifications := make(chan *integrationWatchConfig, 8)
 
-	stop, err := Watch(context.Background(), n.dsn(t, dataID, nil), func(conf *integrationWatchConfig) {
+	stop, err := Watch(context.Background(), n.dsn(t), func(conf *integrationWatchConfig) {
 		notifications <- conf
 	})
 	if err != nil {
@@ -191,17 +204,17 @@ func TestIntegrationWatch(t *testing.T) {
 	}()
 
 	baseline := waitForNotification(t, notifications, pushTimeout)
-	if baseline.Host != "base" {
-		t.Fatalf("baseline Host = %q, want %q", baseline.Host, "base")
+	if baseline.Server.Host != "base" {
+		t.Fatalf("baseline Host = %q, want %q", baseline.Server.Host, "base")
 	}
 
-	if _, err := client.PublishConfig(vo.ConfigParam{DataId: dataID, Group: testGroup, Content: "host: changed\n"}); err != nil {
+	if _, err := client.PublishConfig(vo.ConfigParam{DataId: integrationWatchDataID, Group: testGroup, Content: "host: changed\n"}); err != nil {
 		t.Fatalf("publish change: %v", err)
 	}
 
 	updated := waitForNotification(t, notifications, pushTimeout)
-	if updated.Host != "changed" {
-		t.Fatalf("updated Host = %q, want %q", updated.Host, "changed")
+	if updated.Server.Host != "changed" {
+		t.Fatalf("updated Host = %q, want %q", updated.Server.Host, "changed")
 	}
 	if updated == baseline {
 		t.Fatal("Watch reused the baseline object instead of building a new one")
@@ -211,29 +224,24 @@ func TestIntegrationWatch(t *testing.T) {
 func TestIntegrationWatchStopsReceiving(t *testing.T) {
 	n := newTestNacos(t)
 	client := n.publisher(t)
-	dataID := testDataID(t, "stop.yaml")
-	n.publish(t, client, dataID, "host: base\n")
+	n.publish(t, client, integrationWatchDataID, "host: base\n")
 
-	type conf struct {
-		Host string `yaml:"host"`
-	}
-
-	notifications := make(chan *conf, 8)
-	stop, err := Watch(context.Background(), n.dsn(t, dataID, nil), func(c *conf) {
+	notifications := make(chan *integrationWatchConfig, 8)
+	stop, err := Watch(context.Background(), n.dsn(t), func(c *integrationWatchConfig) {
 		notifications <- c
 	})
 	if err != nil {
 		t.Fatalf("Watch() error = %v", err)
 	}
 
-	if baseline := waitForNotification(t, notifications, pushTimeout); baseline.Host != "base" {
-		t.Fatalf("baseline Host = %q, want %q", baseline.Host, "base")
+	if baseline := waitForNotification(t, notifications, pushTimeout); baseline.Server.Host != "base" {
+		t.Fatalf("baseline Host = %q, want %q", baseline.Server.Host, "base")
 	}
 	if err := stop(context.Background()); err != nil {
 		t.Fatalf("stop() error = %v", err)
 	}
 
-	if _, err := client.PublishConfig(vo.ConfigParam{DataId: dataID, Group: testGroup, Content: "host: after-stop\n"}); err != nil {
+	if _, err := client.PublishConfig(vo.ConfigParam{DataId: integrationWatchDataID, Group: testGroup, Content: "host: after-stop\n"}); err != nil {
 		t.Fatalf("publish change: %v", err)
 	}
 	assertNoNotification(t, notifications, 10*time.Second)
@@ -241,48 +249,50 @@ func TestIntegrationWatchStopsReceiving(t *testing.T) {
 
 func TestIntegrationMissingConfig(t *testing.T) {
 	n := newTestNacos(t)
-	dataID := testDataID(t, "missing.yaml")
-	t.Setenv("CLEANNACOS_TEST_IT_MISSING_HOST", "from-env")
+	client := n.publisher(t)
+	n.delete(t, client, integrationMissingDataID)
 
 	var cfg struct {
-		Host string `yaml:"host" env:"CLEANNACOS_TEST_IT_MISSING_HOST" env-default:"fallback"`
-		Port int    `yaml:"port" env:"CLEANNACOS_TEST_IT_MISSING_PORT" env-default:"8080"`
+		Server struct {
+			Addr string `yaml:"addr" nacos-default:"fallback"`
+			Port int    `yaml:"port" nacos-default:"8080"`
+		} `nacos-data-id:"cleannacos-it-missing.yaml"`
 	}
 
-	err := ReadConfig(context.Background(), n.dsn(t, dataID, nil), &cfg)
+	// A missing config is an empty document, so only the defaults are applied.
+	if err := ReadConfig(context.Background(), n.dsn(t), &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v, want nil for a missing config", err)
+	}
+	if cfg.Server.Addr != "fallback" || cfg.Server.Port != 8080 {
+		t.Fatalf("cfg = %+v, want the defaults of an empty document", cfg)
+	}
+
+	var required struct {
+		Server struct {
+			Addr string `yaml:"addr" nacos-required:"true"`
+		} `nacos-data-id:"cleannacos-it-missing.yaml"`
+	}
+	err := ReadConfig(context.Background(), n.dsn(t), &required)
 	if err == nil {
-		t.Fatal("ReadConfig() = nil, want error for a missing config")
+		t.Fatal("ReadConfig() = nil, want a required field error")
 	}
-	if !strings.Contains(err.Error(), "empty or not found") {
-		t.Fatalf("ReadConfig() error = %q, want an empty config error", err)
-	}
-	t.Logf("missing config error: %v", err)
-
-	// allowEmpty treats the missing content as an empty config, so only the
-	// environment overrides and the env-default values are applied.
-	err = ReadConfig(context.Background(), n.dsn(t, dataID, map[string]string{"allowEmpty": "true"}), &cfg)
-	if err != nil {
-		t.Fatalf("ReadConfig(allowEmpty) error = %v, want nil", err)
-	}
-	if cfg.Host != "from-env" {
-		t.Errorf("Host = %q, want %q", cfg.Host, "from-env")
-	}
-	if cfg.Port != 8080 {
-		t.Errorf("Port = %d, want 8080", cfg.Port)
+	if !strings.Contains(err.Error(), "is required") {
+		t.Fatalf("ReadConfig() error = %q, want a required field error", err)
 	}
 }
 
 func TestIntegrationInvalidContent(t *testing.T) {
 	n := newTestNacos(t)
 	client := n.publisher(t)
-	dataID := testDataID(t, "invalid.yaml")
-	n.publish(t, client, dataID, "host: [broken\n")
+	n.publish(t, client, integrationInvalidDataID, "host: [broken\n")
 
 	var cfg struct {
-		Host string `yaml:"host"`
+		Server struct {
+			Host string `yaml:"host"`
+		} `nacos-data-id:"cleannacos-it-invalid.yaml"`
 	}
 
-	err := ReadConfig(context.Background(), n.dsn(t, dataID, nil), &cfg)
+	err := ReadConfig(context.Background(), n.dsn(t), &cfg)
 	if err == nil {
 		t.Fatal("ReadConfig() = nil, want a parse error")
 	}

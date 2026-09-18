@@ -1,9 +1,8 @@
 package cleannacos
 
 import (
-	"os"
+	"strings"
 	"testing"
-	"time"
 )
 
 func TestResolveFormat(t *testing.T) {
@@ -17,9 +16,9 @@ func TestResolveFormat(t *testing.T) {
 		{dataID: "config.YAML", want: formatYAML},
 		{dataID: "config.json", want: formatJSON},
 		{dataID: "config.toml", want: formatTOML},
-		{dataID: "config.env", want: formatENV},
-		{dataID: "config.edn", want: formatEDN},
 		{dataID: "group/config.json", want: formatJSON},
+		{dataID: "config.env", wantErr: true},
+		{dataID: "config.edn", wantErr: true},
 		{dataID: "config", wantErr: true},
 		{dataID: "", wantErr: true},
 		{dataID: "config.txt", wantErr: true},
@@ -82,30 +81,6 @@ func TestFormatParse(t *testing.T) {
 			t.Fatalf("Port = %d, want 8080", cfg.Port)
 		}
 	})
-
-	t.Run("edn", func(t *testing.T) {
-		var cfg struct {
-			Host string `edn:"host"`
-		}
-		if err := formatEDN.parse(`{:host "example"}`, &cfg); err != nil {
-			t.Fatalf("parse edn: %v", err)
-		}
-		if cfg.Host != "example" {
-			t.Fatalf("Host = %q, want %q", cfg.Host, "example")
-		}
-	})
-
-	t.Run("env", func(t *testing.T) {
-		const key = "CLEANNACOS_TEST_ENV_FILE"
-		t.Setenv(key, "placeholder")
-
-		if err := formatENV.parse(key+"=from-nacos\n", nil); err != nil {
-			t.Fatalf("parse env: %v", err)
-		}
-		if got := os.Getenv(key); got != "from-nacos" {
-			t.Fatalf("%s = %q, want %q", key, got, "from-nacos")
-		}
-	})
 }
 
 func TestFormatParseErrors(t *testing.T) {
@@ -119,33 +94,60 @@ func TestFormatParseErrors(t *testing.T) {
 	if err := formatJSON.parse("{", &cfg); err == nil {
 		t.Fatal("parse invalid json = nil, want error")
 	}
-	if err := formatEDN.parse("{", &cfg); err == nil {
-		t.Fatal("parse invalid edn = nil, want error")
-	}
-	if err := formatENV.parse("not a valid .env line\n", nil); err == nil {
-		t.Fatal("parse invalid env = nil, want error")
+	if err := formatTOML.parse("host = [broken\n", &cfg); err == nil {
+		t.Fatal("parse invalid toml = nil, want error")
 	}
 	if err := format("bogus").parse("host: example\n", &cfg); err == nil {
 		t.Fatal("parse unknown format = nil, want error")
 	}
 }
 
-func TestFormatParseKeepsContentParsable(t *testing.T) {
-	// A layout based parser keeps working through the format indirection.
+func TestFormatRemoved(t *testing.T) {
+	for _, dataID := range []string{"config.env", "config.edn"} {
+		err := func() error {
+			_, err := resolveFormat(dataID)
+
+			return err
+		}()
+		if err == nil {
+			t.Fatalf("resolveFormat(%q) = nil, want error", dataID)
+		}
+		if !strings.Contains(err.Error(), "unsupported extension") {
+			t.Fatalf("resolveFormat(%q) error = %q, want an unsupported extension error", dataID, err)
+		}
+	}
+}
+
+func TestParseHelpers(t *testing.T) {
 	var cfg struct {
-		StartedAt time.Time `yaml:"startedAt" env:"CLEANNACOS_TEST_LAYOUT" env-layout:"2006-01-02"`
-	}
-	t.Setenv("CLEANNACOS_TEST_LAYOUT", "2026-09-17")
-
-	if err := formatYAML.parse("startedAt: 2026-01-02T00:00:00Z\n", &cfg); err != nil {
-		t.Fatalf("parse yaml: %v", err)
-	}
-	if err := ReadEnv(&cfg); err != nil {
-		t.Fatalf("ReadEnv() error = %v", err)
+		Host string `yaml:"host" json:"host"`
+		Port int    `yaml:"port" json:"port"`
 	}
 
-	want := time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC)
-	if !cfg.StartedAt.Equal(want) {
-		t.Fatalf("StartedAt = %s, want %s", cfg.StartedAt, want)
+	if err := ParseYAML(strings.NewReader("host: example\nport: 8080\n"), &cfg); err != nil {
+		t.Fatalf("ParseYAML() error = %v", err)
+	}
+	if cfg.Host != "example" || cfg.Port != 8080 {
+		t.Fatalf("cfg = %+v, want host example and port 8080", cfg)
+	}
+
+	var jsonCfg struct {
+		Host string `json:"host"`
+	}
+	if err := ParseJSON(strings.NewReader(`{"host":"example"}`), &jsonCfg); err != nil {
+		t.Fatalf("ParseJSON() error = %v", err)
+	}
+	if jsonCfg.Host != "example" {
+		t.Fatalf("Host = %q, want %q", jsonCfg.Host, "example")
+	}
+
+	var tomlCfg struct {
+		Port int `toml:"port"`
+	}
+	if err := ParseTOML(strings.NewReader("port = 8080\n"), &tomlCfg); err != nil {
+		t.Fatalf("ParseTOML() error = %v", err)
+	}
+	if tomlCfg.Port != 8080 {
+		t.Fatalf("Port = %d, want 8080", tomlCfg.Port)
 	}
 }

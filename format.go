@@ -1,15 +1,14 @@
 package cleannacos
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path"
 	"strings"
 
-	"github.com/ilyakaznacheev/cleanenv"
-	"github.com/joho/godotenv"
-	"olympos.io/encoding/edn"
+	"github.com/BurntSushi/toml"
+	"gopkg.in/yaml.v3"
 )
 
 // format is the configuration format implied by a dataId extension.
@@ -19,12 +18,27 @@ const (
 	formatYAML format = "yaml"
 	formatJSON format = "json"
 	formatTOML format = "toml"
-	formatENV  format = "env"
-	formatEDN  format = "edn"
 )
 
 // supportedExtensions lists the dataId extensions accepted by this package.
-var supportedExtensions = []string{".yaml", ".yml", ".json", ".toml", ".env", ".edn"}
+var supportedExtensions = []string{".yaml", ".yml", ".json", ".toml"}
+
+// ParseYAML parses YAML from reader to data structure.
+func ParseYAML(r io.Reader, cfg interface{}) error {
+	return yaml.NewDecoder(r).Decode(cfg)
+}
+
+// ParseJSON parses JSON from reader to data structure.
+func ParseJSON(r io.Reader, cfg interface{}) error {
+	return json.NewDecoder(r).Decode(cfg)
+}
+
+// ParseTOML parses TOML from reader to data structure.
+func ParseTOML(r io.Reader, cfg interface{}) error {
+	_, err := toml.NewDecoder(r).Decode(cfg)
+
+	return err
+}
 
 // resolveFormat maps the extension of a dataId to the parser handling it.
 func resolveFormat(dataID string) (format, error) {
@@ -37,10 +51,6 @@ func resolveFormat(dataID string) (format, error) {
 		return formatJSON, nil
 	case ".toml":
 		return formatTOML, nil
-	case ".env":
-		return formatENV, nil
-	case ".edn":
-		return formatEDN, nil
 	case "":
 		return "", fmt.Errorf("cleannacos: dataId %q has no extension, one of %s is required", dataID, supported)
 	default:
@@ -54,34 +64,12 @@ func (f format) parse(content string, cfg interface{}) error {
 
 	switch f {
 	case formatYAML:
-		return cleanenv.ParseYAML(reader, cfg)
+		return ParseYAML(reader, cfg)
 	case formatJSON:
-		return cleanenv.ParseJSON(reader, cfg)
+		return ParseJSON(reader, cfg)
 	case formatTOML:
-		return cleanenv.ParseTOML(reader, cfg)
-	case formatENV:
-		return parseEnv(reader)
-	case formatEDN:
-		return edn.NewDecoder(reader).Decode(cfg)
+		return ParseTOML(reader, cfg)
 	default:
 		return fmt.Errorf("cleannacos: unsupported format %q", string(f))
 	}
-}
-
-// parseEnv parses ENV content and writes every variable into the process
-// environment, mirroring cleanenv's own .env handling. The values are picked up
-// by the cleanenv.ReadEnv call that follows.
-func parseEnv(r io.Reader) error {
-	vars, err := godotenv.Parse(r)
-	if err != nil {
-		return err
-	}
-
-	for key, value := range vars {
-		if err := os.Setenv(key, value); err != nil {
-			return fmt.Errorf("set environment %q: %w", key, err)
-		}
-	}
-
-	return nil
 }

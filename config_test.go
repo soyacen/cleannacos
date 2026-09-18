@@ -1,59 +1,409 @@
 package cleannacos
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
-const testDSN = "nacos://127.0.0.1:8848/app.yaml"
+const testDSN = "nacos://127.0.0.1:8848"
 
-func TestReadConfigMergePrecedence(t *testing.T) {
-	fake := newFakeClient("host: from-nacos\nport: 1\nuser: nacos-user\n")
+// multiSourceConfig is the config structure used by most tests below.
+type multiSourceConfig struct {
+	Server struct {
+		Addr    string        `yaml:"addr" nacos-default:"localhost:8080" nacos-description:"listen address"`
+		Timeout time.Duration `yaml:"timeout" nacos-default:"5s"`
+	} `nacos-data-id:"server.yaml"`
+
+	Database struct {
+		Host      string            `yaml:"host" nacos-required:"true" nacos-description:"database host"`
+		Port      int               `yaml:"port" nacos-default:"5432"`
+		Hosts     []string          `yaml:"hosts" nacos-separator:"|" nacos-default:"db-a|db-b"`
+		Tags      map[string]string `yaml:"tags" nacos-separator:";" nacos-default:"env:prod;tier:1"`
+		StartedAt time.Time         `yaml:"startedAt" nacos-layout:"2006-01-02" nacos-default:"2026-09-17"`
+	} `nacos-data-id:"db.yaml"`
+}
+
+func TestReadConfigMultiSource(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("server.yaml", "addr: 10.0.0.1:9090\n")
+	fake.setContent("db.yaml", "host: db.internal\n")
 	installFakeClient(t, fake)
-	t.Setenv("CLEANNACOS_TEST_HOST", "from-env")
+
+	var cfg multiSourceConfig
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+
+	if cfg.Server.Addr != "10.0.0.1:9090" {
+		t.Errorf("Server.Addr = %q, want %q", cfg.Server.Addr, "10.0.0.1:9090")
+	}
+	if cfg.Server.Timeout != 5*time.Second {
+		t.Errorf("Server.Timeout = %s, want 5s (default)", cfg.Server.Timeout)
+	}
+	if cfg.Database.Host != "db.internal" {
+		t.Errorf("Database.Host = %q, want %q", cfg.Database.Host, "db.internal")
+	}
+	if cfg.Database.Port != 5432 {
+		t.Errorf("Database.Port = %d, want 5432 (default)", cfg.Database.Port)
+	}
+	if got, want := strings.Join(cfg.Database.Hosts, ","), "db-a,db-b"; got != want {
+		t.Errorf("Database.Hosts = %q, want %q", got, want)
+	}
+	if cfg.Database.Tags["env"] != "prod" || cfg.Database.Tags["tier"] != "1" {
+		t.Errorf("Database.Tags = %+v, want env:prod and tier:1", cfg.Database.Tags)
+	}
+	want := time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC)
+	if !cfg.Database.StartedAt.Equal(want) {
+		t.Errorf("Database.StartedAt = %s, want %s", cfg.Database.StartedAt, want)
+	}
+
+	if got, want := fake.getDataIDs(), []string{"db.yaml", "server.yaml"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("fetched dataIds = %v, want %v", got, want)
+	}
+}
+
+func TestReadConfigDefaultsOnlyForZeroValues(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("server.yaml", "addr: from-nacos\ntimeout: 1s\n")
+	fake.setContent("db.yaml", "host: db\n")
+	installFakeClient(t, fake)
+
+	var cfg multiSourceConfig
+	cfg.Server.Addr = "preset"
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+
+	if cfg.Server.Addr != "from-nacos" {
+		t.Errorf("Server.Addr = %q, want %q (content wins over the preset)", cfg.Server.Addr, "from-nacos")
+	}
+	if cfg.Server.Timeout != time.Second {
+		t.Errorf("Server.Timeout = %s, want 1s (content wins over the default)", cfg.Server.Timeout)
+	}
+}
+
+func TestReadConfigNestedDataIDOverrides(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("app.yaml", "host: from-app\nport: 1\n")
+	fake.setContent("override.yaml", "port: 2\n")
+	installFakeClient(t, fake)
 
 	var cfg struct {
-		Host  string `yaml:"host" env:"CLEANNACOS_TEST_HOST" env-default:"from-default"`
-		Port  int    `yaml:"port" env:"CLEANNACOS_TEST_PORT" env-default:"1234"`
-		User  string `yaml:"user" env:"CLEANNACOS_TEST_USER" env-default:"default-user"`
-		Pass  string `yaml:"password" env:"CLEANNACOS_TEST_PASS"`
-		Level string `yaml:"level" env:"CLEANNACOS_TEST_LEVEL" env-default:"info"`
+		DB struct {
+			Host string `yaml:"host"`
+			Port int    `yaml:"port"`
+			Pool struct {
+				Size int `yaml:"size" nacos-default:"10"`
+			} `yaml:"pool" nacos-data-id:"override.yaml"`
+		} `yaml:"db" nacos-data-id:"app.yaml"`
 	}
 
 	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
 		t.Fatalf("ReadConfig() error = %v", err)
 	}
 
-	if cfg.Host != "from-env" {
-		t.Errorf("Host = %q, want %q (environment overrides Nacos)", cfg.Host, "from-env")
+	if cfg.DB.Host != "from-app" {
+		t.Errorf("DB.Host = %q, want %q", cfg.DB.Host, "from-app")
 	}
-	if cfg.Port != 1 {
-		t.Errorf("Port = %d, want 1 (Nacos overrides env-default)", cfg.Port)
+	if cfg.DB.Port != 1 {
+		t.Errorf("DB.Port = %d, want 1", cfg.DB.Port)
 	}
-	if cfg.User != "nacos-user" {
-		t.Errorf("User = %q, want %q", cfg.User, "nacos-user")
+	if cfg.DB.Pool.Size != 10 {
+		t.Errorf("DB.Pool.Size = %d, want 10 (default of the nested source)", cfg.DB.Pool.Size)
 	}
-	if cfg.Pass != "" {
-		t.Errorf("Pass = %q, want empty", cfg.Pass)
+}
+
+func TestReadConfigSourceOverrides(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContentIn("dev", "DATABASE", "db.yaml", "host: scoped\n")
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		Database struct {
+			Host string `yaml:"host" nacos-required:"true"`
+		} `nacos-data-id:"db.yaml" nacos-group:"DATABASE" nacos-namespace:"dev"`
 	}
-	if cfg.Level != "info" {
-		t.Errorf("Level = %q, want %q (env-default fills the gap)", cfg.Level, "info")
+
+	dsn := testDSN + "?namespace=other&group=OTHER"
+	if err := ReadConfig(context.Background(), dsn, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
 	}
-	if !fake.isClosed() {
-		t.Error("ReadConfig() did not close the client")
+	if cfg.Database.Host != "scoped" {
+		t.Fatalf("Database.Host = %q, want %q", cfg.Database.Host, "scoped")
+	}
+	if got := fake.lastGet().Group; got != "DATABASE" {
+		t.Errorf("group = %q, want %q (nacos-group wins)", got, "DATABASE")
+	}
+}
+
+func TestReadConfigDeduplicatesSources(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("shared.yaml", "host: shared\n")
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		First  struct{ Host string } `nacos-data-id:"shared.yaml"`
+		Second struct{ Host string } `nacos-data-id:"shared.yaml"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+
+	if count := fake.countCalls("get"); count != 1 {
+		t.Errorf("get calls = %d, want 1 for a dataId used twice", count)
+	}
+	if cfg.First.Host != "shared" || cfg.Second.Host != "shared" {
+		t.Errorf("cfg = %+v, want both fields filled from the shared dataId", cfg)
+	}
+}
+
+func TestReadConfigUntaggedFieldsAreIgnored(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("app.yaml", "host: from-nacos\n")
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		Local struct {
+			Mode string `nacos-default:"debug"`
+		}
+		Remote struct {
+			Host string `yaml:"host"`
+		} `nacos-data-id:"app.yaml"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+
+	if cfg.Local.Mode != "" {
+		t.Errorf("Local.Mode = %q, want it to stay untouched without a dataId", cfg.Local.Mode)
+	}
+	if cfg.Remote.Host != "from-nacos" {
+		t.Errorf("Remote.Host = %q, want %q", cfg.Remote.Host, "from-nacos")
+	}
+}
+
+func TestReadConfigPointerSubtree(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("db.yaml", "host: db.internal\n")
+	installFakeClient(t, fake)
+
+	type dbOptions struct {
+		Host string `yaml:"host" nacos-required:"true"`
+		Port int    `yaml:"port" nacos-default:"5432"`
+	}
+
+	var cfg struct {
+		DB *dbOptions `nacos-data-id:"db.yaml"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+	if cfg.DB == nil {
+		t.Fatal("DB = nil, want an allocated subtree")
+	}
+	if cfg.DB.Host != "db.internal" || cfg.DB.Port != 5432 {
+		t.Fatalf("DB = %+v, want host db.internal and port 5432", *cfg.DB)
+	}
+}
+
+func TestReadConfigRequiredInNilPointerSubtree(t *testing.T) {
+	fake := newFakeClient()
+	installFakeClient(t, fake)
+
+	type dbOptions struct {
+		Host string `yaml:"host" nacos-required:"true"`
+	}
+
+	var cfg struct {
+		DB *dbOptions `nacos-data-id:"db.yaml"`
+	}
+
+	err := ReadConfig(context.Background(), testDSN, &cfg)
+	if err == nil {
+		t.Fatal("ReadConfig() = nil, want a required field error")
+	}
+	if !strings.Contains(err.Error(), "is required") {
+		t.Fatalf("ReadConfig() error = %q, want a required field error", err)
+	}
+	if cfg.DB != nil {
+		t.Errorf("DB = %+v, want it to stay nil", cfg.DB)
+	}
+}
+
+func TestReadConfigNestedDataIDInsideUntaggedField(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("nested.yaml", "host: nested\n")
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		Local struct {
+			Mode string `nacos-default:"debug"`
+			Sub  struct {
+				Host string `yaml:"host"`
+			} `nacos-data-id:"nested.yaml"`
+		}
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+
+	if cfg.Local.Sub.Host != "nested" {
+		t.Errorf("Local.Sub.Host = %q, want %q", cfg.Local.Sub.Host, "nested")
+	}
+	if cfg.Local.Mode != "" {
+		t.Errorf("Local.Mode = %q, want it to stay untouched", cfg.Local.Mode)
+	}
+}
+
+func TestReadConfigEmptyContentIsAnEmptyDocument(t *testing.T) {
+	fake := newFakeClient()
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		Server struct {
+			Addr string `yaml:"addr" nacos-default:"fallback"`
+			Port int    `yaml:"port" nacos-default:"8080"`
+		} `nacos-data-id:"missing.yaml"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+	if cfg.Server.Addr != "fallback" || cfg.Server.Port != 8080 {
+		t.Fatalf("cfg = %+v, want the defaults of an empty document", cfg)
+	}
+}
+
+func TestReadConfigRequiredField(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("app.yaml", "name: \n")
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		App struct {
+			Name string `yaml:"name" nacos-required:"true"`
+		} `nacos-data-id:"app.yaml"`
+	}
+
+	err := ReadConfig(context.Background(), testDSN, &cfg)
+	if err == nil {
+		t.Fatal("ReadConfig() = nil, want a required field error")
+	}
+	if !strings.Contains(err.Error(), "is required") || !strings.Contains(err.Error(), "app.yaml") {
+		t.Fatalf("ReadConfig() error = %q, want a required field error naming the dataId", err)
+	}
+}
+
+func TestReadConfigRequiredSatisfiedByDefault(t *testing.T) {
+	fake := newFakeClient()
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		App struct {
+			Name string `yaml:"name" nacos-required:"true" nacos-default:"fallback"`
+		} `nacos-data-id:"app.yaml"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+	if cfg.App.Name != "fallback" {
+		t.Fatalf("App.Name = %q, want %q", cfg.App.Name, "fallback")
+	}
+}
+
+func TestReadConfigCustomSetter(t *testing.T) {
+	fake := newFakeClient()
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		App struct {
+			Mode upper `yaml:"mode" nacos-default:"debug"`
+		} `nacos-data-id:"app.yaml"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+	if cfg.App.Mode != "DEBUG!" {
+		t.Fatalf("App.Mode = %q, want %q", cfg.App.Mode, "DEBUG!")
+	}
+}
+
+type upper string
+
+func (u *upper) SetValue(value string) error {
+	*u = upper(strings.ToUpper(value) + "!")
+
+	return nil
+}
+
+func TestReadConfigJSONAndTOML(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("app.json", `{"host":"json-host"}`)
+	fake.setContent("app.toml", "port = 7000\n")
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		JSON struct {
+			Host string `json:"host"`
+		} `nacos-data-id:"app.json"`
+		TOML struct {
+			Port int `toml:"port"`
+		} `nacos-data-id:"app.toml"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+	if cfg.JSON.Host != "json-host" {
+		t.Errorf("JSON.Host = %q, want %q", cfg.JSON.Host, "json-host")
+	}
+	if cfg.TOML.Port != 7000 {
+		t.Errorf("TOML.Port = %d, want 7000", cfg.TOML.Port)
+	}
+}
+
+func TestReadConfigUnsupportedExtension(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("app.env", "HOST=from-env\n")
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		App struct {
+			Host string `yaml:"host"`
+		} `nacos-data-id:"app.env"`
+	}
+
+	err := ReadConfig(context.Background(), testDSN, &cfg)
+	if err == nil {
+		t.Fatal("ReadConfig() = nil, want an unsupported extension error")
+	}
+	if !strings.Contains(err.Error(), "unsupported extension") {
+		t.Fatalf("ReadConfig() error = %q, want an unsupported extension error", err)
 	}
 }
 
 func TestReadConfigProviderError(t *testing.T) {
-	fake := newFakeClient("")
+	fake := newFakeClient()
 	fake.getErr = errors.New("boom")
 	installFakeClient(t, fake)
 
-	var cfg struct{}
+	var cfg struct {
+		App struct {
+			Host string `yaml:"host"`
+		} `nacos-data-id:"app.yaml"`
+	}
+
 	err := ReadConfig(context.Background(), testDSN, &cfg)
 	if err == nil {
 		t.Fatal("ReadConfig() = nil, want error")
@@ -66,168 +416,65 @@ func TestReadConfigProviderError(t *testing.T) {
 	}
 }
 
-func TestReadConfigEmptyContent(t *testing.T) {
-	t.Run("empty content is an error by default", func(t *testing.T) {
-		fake := newFakeClient("")
-		installFakeClient(t, fake)
-
-		var cfg struct {
-			Host string `yaml:"host" env:"CLEANNACOS_TEST_EMPTY_HOST" env-default:"fallback"`
-		}
-		err := ReadConfig(context.Background(), testDSN, &cfg)
-		if err == nil {
-			t.Fatal("ReadConfig() = nil, want error")
-		}
-		if !strings.Contains(err.Error(), "empty or not found") {
-			t.Fatalf("ReadConfig() error = %q, want an empty config error", err)
-		}
-		if cfg.Host != "" {
-			t.Errorf("Host = %q, want the struct to stay untouched", cfg.Host)
-		}
-	})
-
-	t.Run("allowEmpty applies env overrides and defaults", func(t *testing.T) {
-		fake := newFakeClient("")
-		installFakeClient(t, fake)
-		t.Setenv("CLEANNACOS_TEST_ALLOW_EMPTY", "from-env")
-
-		var cfg struct {
-			Host string `yaml:"host" env:"CLEANNACOS_TEST_ALLOW_EMPTY" env-default:"fallback"`
-			Port int    `yaml:"port" env:"CLEANNACOS_TEST_ALLOW_EMPTY_PORT" env-default:"8080"`
-		}
-
-		dsn := testDSN + "?allowEmpty=true"
-		if err := ReadConfig(context.Background(), dsn, &cfg); err != nil {
-			t.Fatalf("ReadConfig() error = %v", err)
-		}
-		if cfg.Host != "from-env" {
-			t.Errorf("Host = %q, want %q", cfg.Host, "from-env")
-		}
-		if cfg.Port != 8080 {
-			t.Errorf("Port = %d, want 8080", cfg.Port)
-		}
-	})
-}
-
-func TestReadConfigRequiredField(t *testing.T) {
-	fake := newFakeClient("{}")
+func TestReadConfigParseErrorNamesTheSource(t *testing.T) {
+	fake := newFakeClient()
+	fake.setContent("app.yaml", "host: [broken\n")
 	installFakeClient(t, fake)
 
 	var cfg struct {
-		Name string `yaml:"name" env:"CLEANNACOS_TEST_REQUIRED" env-required:"true"`
+		App struct {
+			Host string `yaml:"host"`
+		} `nacos-data-id:"app.yaml"`
 	}
 
 	err := ReadConfig(context.Background(), testDSN, &cfg)
 	if err == nil {
-		t.Fatal("ReadConfig() = nil, want a required field error")
+		t.Fatal("ReadConfig() = nil, want a parse error")
 	}
-	if !strings.Contains(err.Error(), "is required") {
-		t.Fatalf("ReadConfig() error = %q, want a required field error", err)
-	}
-}
-
-func TestReadConfigNestedPrefixAndSeparators(t *testing.T) {
-	content := strings.Join([]string{
-		"db:",
-		"  hosts:",
-		"    - nacos-a",
-		"    - nacos-b",
-		"  tags:",
-		"    from: nacos",
-		"",
-	}, "\n")
-
-	fake := newFakeClient(content)
-	installFakeClient(t, fake)
-	t.Setenv("CLEANNACOS_TEST_APP_HOSTS", "env-a|env-b")
-	t.Setenv("CLEANNACOS_TEST_APP_TAGS", "k1:v1;k2:v2")
-
-	var cfg struct {
-		DB struct {
-			Hosts   []string          `yaml:"hosts" env:"HOSTS" env-separator:"|"`
-			Tags    map[string]string `yaml:"tags" env:"TAGS" env-separator:";"`
-			TimeOut time.Duration     `yaml:"timeout" env:"TIMEOUT" env-default:"3s"`
-		} `yaml:"db" env-prefix:"CLEANNACOS_TEST_APP_"`
-	}
-
-	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
-		t.Fatalf("ReadConfig() error = %v", err)
-	}
-
-	if got, want := strings.Join(cfg.DB.Hosts, ","), "env-a,env-b"; got != want {
-		t.Errorf("Hosts = %q, want %q", got, want)
-	}
-	if got, want := cfg.DB.Tags["k1"], "v1"; got != want {
-		t.Errorf("Tags[k1] = %q, want %q", got, want)
-	}
-	if got, want := cfg.DB.Tags["k2"], "v2"; got != want {
-		t.Errorf("Tags[k2] = %q, want %q", got, want)
-	}
-	if _, ok := cfg.DB.Tags["from"]; ok {
-		t.Errorf("Tags = %+v, want the map to be replaced by the environment value", cfg.DB.Tags)
-	}
-	if cfg.DB.TimeOut != 3*time.Second {
-		t.Errorf("TimeOut = %s, want 3s", cfg.DB.TimeOut)
-	}
-}
-
-func TestReadConfigTimeLayout(t *testing.T) {
-	fake := newFakeClient("{}")
-	installFakeClient(t, fake)
-	t.Setenv("CLEANNACOS_TEST_STARTED", "2026-09-17")
-
-	var cfg struct {
-		StartedAt time.Time `yaml:"startedAt" env:"CLEANNACOS_TEST_STARTED" env-layout:"2006-01-02"`
-	}
-
-	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
-		t.Fatalf("ReadConfig() error = %v", err)
-	}
-
-	want := time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC)
-	if !cfg.StartedAt.Equal(want) {
-		t.Fatalf("StartedAt = %s, want %s", cfg.StartedAt, want)
-	}
-}
-
-func TestReadConfigTargetsDSN(t *testing.T) {
-	fake := newFakeClient("{}")
-	installFakeClient(t, fake)
-
-	var cfg struct{}
-	dsn := "nacos://example.com:8849/group/app.json?group=APP"
-	if err := ReadConfig(context.Background(), dsn, &cfg); err != nil {
-		t.Fatalf("ReadConfig() error = %v", err)
-	}
-
-	if fake.lastGetParam.DataId != "group/app.json" {
-		t.Errorf("DataId = %q, want %q", fake.lastGetParam.DataId, "group/app.json")
-	}
-	if fake.lastGetParam.Group != "APP" {
-		t.Errorf("Group = %q, want %q", fake.lastGetParam.Group, "APP")
+	if !strings.Contains(err.Error(), `parse config "app.yaml"`) {
+		t.Fatalf("ReadConfig() error = %q, want it to name the source", err)
 	}
 }
 
 func TestUpdateConfigRefetches(t *testing.T) {
-	fake := newFakeClient("host: first\n")
+	fake := newFakeClient()
+	fake.setContent("app.yaml", "host: first\n")
 	installFakeClient(t, fake)
 
 	var cfg struct {
-		Host string `yaml:"host"`
+		App struct {
+			Host string `yaml:"host"`
+		} `nacos-data-id:"app.yaml"`
 	}
 	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
 		t.Fatalf("ReadConfig() error = %v", err)
 	}
-	if cfg.Host != "first" {
-		t.Fatalf("Host = %q, want %q", cfg.Host, "first")
+	if cfg.App.Host != "first" {
+		t.Fatalf("App.Host = %q, want %q", cfg.App.Host, "first")
 	}
 
-	fake.setContent("host: second\n")
+	fake.setContent("app.yaml", "host: second\n")
 	if err := UpdateConfig(context.Background(), testDSN, &cfg); err != nil {
 		t.Fatalf("UpdateConfig() error = %v", err)
 	}
-	if cfg.Host != "second" {
-		t.Fatalf("Host = %q, want %q", cfg.Host, "second")
+	if cfg.App.Host != "second" {
+		t.Fatalf("App.Host = %q, want %q", cfg.App.Host, "second")
+	}
+}
+
+func TestReadConfigWithoutSourcesSkipsTheClient(t *testing.T) {
+	fake := newFakeClient()
+	installFakeClient(t, fake)
+
+	var cfg struct {
+		Local string `nacos-default:"ignored"`
+	}
+
+	if err := ReadConfig(context.Background(), testDSN, &cfg); err != nil {
+		t.Fatalf("ReadConfig() error = %v", err)
+	}
+	if calls := fake.callOrder(); len(calls) != 0 {
+		t.Fatalf("client calls = %v, want none", calls)
 	}
 }
 
@@ -243,8 +490,18 @@ func TestReadConfigInvalidDSN(t *testing.T) {
 	}
 }
 
+func TestReadConfigRejectsNonPointer(t *testing.T) {
+	err := ReadConfig(context.Background(), testDSN, struct{}{})
+	if err == nil {
+		t.Fatal("ReadConfig() = nil, want error")
+	}
+	if !strings.Contains(err.Error(), "non-nil pointer") {
+		t.Fatalf("ReadConfig() error = %q, want a pointer error", err)
+	}
+}
+
 func TestReadConfigCancelledContext(t *testing.T) {
-	fake := newFakeClient("{}")
+	fake := newFakeClient()
 	installFakeClient(t, fake)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -260,80 +517,110 @@ func TestReadConfigCancelledContext(t *testing.T) {
 	}
 }
 
-func TestEnvHelpers(t *testing.T) {
-	t.Setenv("CLEANNACOS_TEST_READ_ENV", "from-env")
-
-	var cfg struct {
-		Value string `env:"CLEANNACOS_TEST_READ_ENV"`
-	}
-	if err := ReadEnv(&cfg); err != nil {
-		t.Fatalf("ReadEnv() error = %v", err)
-	}
-	if cfg.Value != "from-env" {
-		t.Fatalf("Value = %q, want %q", cfg.Value, "from-env")
-	}
-}
-
-func TestUpdateEnvKeepsStaticFields(t *testing.T) {
-	t.Setenv("CLEANNACOS_TEST_UPD_STATIC", "static-first")
-	t.Setenv("CLEANNACOS_TEST_UPD_VALUE", "value-first")
-
-	var cfg struct {
-		Static string `env:"CLEANNACOS_TEST_UPD_STATIC"`
-		Value  string `env:"CLEANNACOS_TEST_UPD_VALUE" env-upd:"true"`
-	}
-	if err := ReadEnv(&cfg); err != nil {
-		t.Fatalf("ReadEnv() error = %v", err)
-	}
-
-	t.Setenv("CLEANNACOS_TEST_UPD_STATIC", "static-second")
-	t.Setenv("CLEANNACOS_TEST_UPD_VALUE", "value-second")
-
-	if err := UpdateEnv(&cfg); err != nil {
-		t.Fatalf("UpdateEnv() error = %v", err)
-	}
-	if cfg.Static != "static-first" {
-		t.Errorf("Static = %q, want %q (env-upd is not set)", cfg.Static, "static-first")
-	}
-	if cfg.Value != "value-second" {
-		t.Errorf("Value = %q, want %q (env-upd is set)", cfg.Value, "value-second")
-	}
-}
-
 func TestGetDescription(t *testing.T) {
 	cfg := struct {
-		Addr string `env:"CLEANNACOS_TEST_DESC_ADDR" env-description:"listen address" env-default:"localhost:8080"`
-		Port int    `env:"CLEANNACOS_TEST_DESC_PORT" env-description:"listen port" env-default:"8080"`
+		Server struct {
+			Addr string `yaml:"addr" nacos-description:"listen address" nacos-default:"localhost:8080"`
+		} `nacos-data-id:"server.yaml"`
+		Database struct {
+			Host string `yaml:"host" nacos-required:"true" nacos-description:"database host"`
+		} `nacos-data-id:"db.yaml"`
+		Ignored string `nacos-description:"never read"`
 	}{}
 
-	header := "Test config:"
-	description, err := GetDescription(&cfg, &header)
+	description, err := GetDescription(&cfg, nil)
 	if err != nil {
 		t.Fatalf("GetDescription() error = %v", err)
 	}
 
 	for _, want := range []string{
-		"Test config:",
-		"CLEANNACOS_TEST_DESC_ADDR",
+		"Nacos configuration:",
+		"server.yaml:addr",
 		"listen address",
-		`"localhost:8080"`,
-		"CLEANNACOS_TEST_DESC_PORT",
+		`(default "localhost:8080")`,
+		"db.yaml:host",
+		"database host",
+		"(required)",
 	} {
 		if !strings.Contains(description, want) {
 			t.Errorf("description %q does not contain %q", description, want)
 		}
 	}
+	if strings.Contains(description, "never read") {
+		t.Errorf("description %q contains an untagged field", description)
+	}
+
+	header := "Test config:"
+	custom, err := GetDescription(&cfg, &header)
+	if err != nil {
+		t.Fatalf("GetDescription() error = %v", err)
+	}
+	if !strings.HasPrefix(custom, "Test config:") {
+		t.Errorf("description %q does not start with the custom header", custom)
+	}
 }
 
-func TestFUsage(t *testing.T) {
+func TestGetDescriptionKeyPathsAreRelativeToTheDataSource(t *testing.T) {
 	cfg := struct {
-		Addr string `env:"CLEANNACOS_TEST_USAGE_ADDR" env-description:"listen address"`
+		Server struct {
+			Pool struct {
+				Size int `yaml:"size" nacos-description:"pool size"`
+			} `yaml:"pool"`
+		} `nacos-data-id:"server.yaml"`
 	}{}
 
-	var buf bytes.Buffer
-	FUsage(&buf, &cfg, nil)()
+	description, err := GetDescription(&cfg, nil)
+	if err != nil {
+		t.Fatalf("GetDescription() error = %v", err)
+	}
+	if !strings.Contains(description, "server.yaml:pool.size") {
+		t.Fatalf("description = %q, want the key path relative to the dataId", description)
+	}
+}
 
-	if !strings.Contains(buf.String(), "CLEANNACOS_TEST_USAGE_ADDR") {
-		t.Fatalf("usage output %q does not contain the environment variable name", buf.String())
+// EmbeddedOptions is embedded to check that inlined fields keep the key path of
+// their embedding struct.
+type EmbeddedOptions struct {
+	Addr string `yaml:"addr" nacos-description:"embedded address"`
+}
+
+func TestGetDescriptionInlinesEmbeddedStructs(t *testing.T) {
+	cfg := struct {
+		Server struct {
+			EmbeddedOptions
+			Pool struct {
+				Size int `yaml:"size" nacos-description:"pool size"`
+			} `yaml:"pool"`
+		} `nacos-data-id:"server.yaml"`
+	}{}
+
+	description, err := GetDescription(&cfg, nil)
+	if err != nil {
+		t.Fatalf("GetDescription() error = %v", err)
+	}
+	for _, want := range []string{"server.yaml:addr", "server.yaml:pool.size"} {
+		if !strings.Contains(description, want) {
+			t.Errorf("description = %q, want it to contain %q", description, want)
+		}
+	}
+}
+
+func TestGetDescriptionIsEmptyWithoutSources(t *testing.T) {
+	var cfg struct {
+		Local string `nacos-description:"never read"`
+	}
+
+	description, err := GetDescription(&cfg, nil)
+	if err != nil {
+		t.Fatalf("GetDescription() error = %v", err)
+	}
+	if description != "" {
+		t.Fatalf("GetDescription() = %q, want an empty string", description)
+	}
+}
+
+func TestGetDescriptionRejectsNonPointer(t *testing.T) {
+	if _, err := GetDescription(struct{}{}, nil); err == nil {
+		t.Fatal("GetDescription() = nil, want error")
 	}
 }

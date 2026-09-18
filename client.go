@@ -21,16 +21,17 @@ type closer interface {
 	CloseClient()
 }
 
-// newClient builds the config client for a DSN. It is a variable so tests can
-// inject a fake client.
-var newClient = func(d *dsn) (configClient, error) {
-	return newNacosClient(d)
+// newClient builds the config client for a DSN and namespace. It is a variable
+// so tests can inject a fake client.
+var newClient = func(d *dsn, namespace string) (configClient, error) {
+	return newNacosClient(d, namespace)
 }
 
-// newNacosClient creates a Nacos config client from the parsed DSN.
-func newNacosClient(d *dsn) (configClient, error) {
+// newNacosClient creates a Nacos config client for one namespace. The rest of
+// the connection settings come from the DSN.
+func newNacosClient(d *dsn, namespace string) (configClient, error) {
 	options := []constant.ClientOption{
-		constant.WithNamespaceId(d.namespace),
+		constant.WithNamespaceId(namespace),
 		constant.WithLogDir(d.logDir),
 		constant.WithCacheDir(d.cacheDir),
 	}
@@ -58,7 +59,7 @@ func newNacosClient(d *dsn) (configClient, error) {
 		ServerConfigs: []constant.ServerConfig{*constant.NewServerConfig(d.host, d.port)},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("cleannacos: create nacos client for %s: %w", d.ident(), err)
+		return nil, fmt.Errorf("cleannacos: create nacos client for %s and namespace %q: %w", d.serverIdent(), namespace, err)
 	}
 
 	return client, nil
@@ -71,7 +72,47 @@ func closeClient(c configClient) {
 	}
 }
 
-// configParam addresses the config described by the DSN.
-func (d *dsn) configParam() vo.ConfigParam {
-	return vo.ConfigParam{DataId: d.dataID, Group: d.group}
+// clientPool keeps one Nacos client per namespace, because the namespace is a
+// client level setting of the Nacos SDK while nacos-namespace is a field level
+// tag.
+type clientPool struct {
+	dsn     *dsn
+	factory func(*dsn, string) (configClient, error)
+	clients map[string]configClient
+}
+
+// newClientPool creates a pool that builds clients lazily.
+func newClientPool(d *dsn) *clientPool {
+	return &clientPool{
+		dsn:     d,
+		factory: newClient,
+		clients: make(map[string]configClient),
+	}
+}
+
+// client returns the client of a namespace, creating it on first use.
+func (p *clientPool) client(namespace string) (configClient, error) {
+	if client, ok := p.clients[namespace]; ok {
+		return client, nil
+	}
+
+	client, err := p.factory(p.dsn, namespace)
+	if err != nil {
+		return nil, err
+	}
+	p.clients[namespace] = client
+
+	return client, nil
+}
+
+// configParam addresses one source inside a namespace.
+func (s source) configParam() vo.ConfigParam {
+	return vo.ConfigParam{DataId: s.dataID, Group: s.group}
+}
+
+// closeAll releases every client created by the pool.
+func (p *clientPool) closeAll() {
+	for _, client := range p.clients {
+		closeClient(client)
+	}
 }

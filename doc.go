@@ -1,35 +1,42 @@
-// Package cleannacos reads configuration from Nacos with the cleanenv API.
+// Package cleannacos reads configuration from Nacos into Go structures.
 //
-// It mirrors github.com/ilyakaznacheev/cleanenv and replaces the local file
-// source with a Nacos config source, so migrating only means changing the
-// import path and passing a DSN:
+// The package only reads Nacos: there is no environment variable layer and no
+// local file layer. The DSN describes the Nacos server, and every field of the
+// config structure declares where its value comes from through nacos-* struct
+// tags:
 //
-//	// before
-//	err := cleanenv.ReadConfig("config.yml", &cfg)
+//	type Config struct {
+//		Server struct {
+//			Addr string `yaml:"addr" nacos-default:"localhost:8080" nacos-description:"listen address"`
+//		} `nacos-data-id:"server.yaml"`
+//		Database struct {
+//			Hosts []string `yaml:"hosts" nacos-separator:"," nacos-default:"db-a,db-b"`
+//		} `nacos-data-id:"db.yaml" nacos-group:"DATABASE"`
+//	}
 //
-//	// after
-//	err := cleannacos.ReadConfig(ctx, "nacos://127.0.0.1:8848/config.yml?group=DEFAULT_GROUP", &cfg)
+//	var cfg Config
 //
-// Parsing, environment variable overrides, env-default values and the
-// description helpers are delegated to cleanenv; this package only fetches the
-// content, orders the merge (Nacos content -> environment variables ->
-// env-default) and adds change watching.
+//	err := cleannacos.ReadConfig(ctx, "nacos://127.0.0.1:8848?group=DEFAULT_GROUP", &cfg)
 //
-// The DSN carries the connection parameters and always addresses one config:
+// The DSN must not carry a path:
 //
-//	nacos://user:pass@host:8848/dataId.yaml?namespace=ns&group=g&timeoutMs=5000
+//	nacos://user:pass@host:8848?namespace=ns&group=g&timeoutMs=5000
 //
-// The dataId extension selects the parser: .yaml/.yml, .json, .toml, .env or
-// .edn.
+// The extension of a dataId selects the parser: .yaml/.yml, .json or .toml.
+//
+// # Merging
+//
+// Sources are parsed from the outside in, so a nested nacos-data-id overrides
+// the values of its enclosing document. Afterwards every field that still
+// holds its zero value receives its nacos-default, and fields marked with
+// nacos-required must hold a value. Data sources are declared per field and
+// may be placed at any nesting level; a field without a reachable dataId is
+// left untouched.
 //
 // # Watching for changes
 //
 // Watch hands a freshly merged *T to the callback and serializes every
 // callback, so the callback can simply swap an atomic pointer:
-//
-//	type Config struct {
-//		Addr string `yaml:"addr" env:"ADDR" env-default:"localhost:8080"`
-//	}
 //
 //	var current atomic.Pointer[Config]
 //
