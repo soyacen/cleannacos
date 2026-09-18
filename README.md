@@ -205,20 +205,6 @@ func ParseTOML(r io.Reader, cfg interface{}) error
 
 同时导出的标签常量：`TagNacosDataID`、`TagNacosGroup`、`TagNacosNamespace`、`TagNacosDefault`、`TagNacosRequired`、`TagNacosDescription`、`TagNacosLayout`、`TagNacosSeparator`。
 
-## 从 v0.0.x 升级
-
-v0.1.0 是破坏性变更：库不再复用 cleanenv，也不再读取环境变量。
-
-| v0.0.x                                                                                                         | v0.1.0                                                                                                                                  |
-| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `nacos://host:8848/app.yaml`（DSN 带 dataId）                                                                | `nacos://host:8848` + 字段 `nacos-data-id:"app.yaml"`                                                                               |
-| `env:"HOST"` / `env-default` / `env-required` / `env-description` / `env-layout` / `env-separator` | 对应改成`nacos-default` / `nacos-required` / `nacos-description` / `nacos-layout` / `nacos-separator`；字段名不再指向环境变量 |
-| 环境变量覆盖 Nacos 内容                                                                                        | 只有 Nacos 内容与`nacos-default`，环境变量不再参与                                                                                    |
-| 空配置默认报错，`allowEmpty=true` 放开                                                                       | 空内容一律按空文档处理，`allowEmpty` 参数移除                                                                                         |
-| `ReadEnv` / `UpdateEnv` / `Usage` / `FUsage` / `TagEnv*` / `Updater`                               | 已删除                                                                                                                                  |
-| `.env` / `.edn` 格式                                                                                       | 已移除，只保留`.yaml` / `.yml` / `.json` / `.toml`                                                                              |
-| 只能监听 DSN 里的一个 dataId                                                                                   | `Watch` 同时监听结构体声明的全部 dataId                                                                                               |
-
 ## 开发
 
 ```bash
