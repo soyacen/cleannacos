@@ -1,0 +1,28 @@
+# Local Nacos used by the integration tests and the examples.
+#
+#	make nacos-up     # start it
+#	make nacos-wait   # block until it answers its readiness probe
+#	make nacos-down   # stop it and drop the data
+#
+# The image is pinned to the version the CI integration job uses. There is no
+# volume, so everything Nacos stored lives inside the container and is removed
+# by `docker compose down -v`.
+services:
+  nacos:
+    image: nacos/nacos-server:v2.5.2
+    container_name: cleannacos-nacos
+    environment:
+      MODE: standalone
+      NACOS_AUTH_ENABLE: "false"
+    ports:
+      # nacos-sdk-go derives the gRPC port from the HTTP port (+1000), so the
+      # two mappings have to move together:
+      # NACOS_GRPC_PORT must stay equal to NACOS_HTTP_PORT + 1000.
+      - "${NACOS_HTTP_PORT:-8848}:8848"
+      - "${NACOS_GRPC_PORT:-9848}:9848"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8848/nacos/v1/console/health/readiness || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 30s

@@ -81,16 +81,16 @@ func main() {
 
 ## 标签总览
 
-| tag | 作用 |
-| --- | --- |
-| `nacos-data-id` | 该字段子树的数据源，任意层级可用，多层重声明时内层覆盖外层 |
-| `nacos-group` | 覆盖该字段子树的 group，缺省用 DSN 的 `group` |
-| `nacos-namespace` | 覆盖该字段子树的 namespace，缺省用 DSN 的 `namespace` |
-| `nacos-default` | 字段仍是零值时填入的默认值 |
-| `nacos-required` | 默认值生效后仍为零值则报错，错误里带字段路径与 dataId |
-| `nacos-description` | 供 `GetDescription` 输出的说明 |
-| `nacos-layout` | 默认值转 `time.Time` 等类型时使用的时间布局 |
-| `nacos-separator` | 默认值转 slice / map 时使用的分隔符，缺省 `,` |
+| tag                   | 作用                                                       |
+| --------------------- | ---------------------------------------------------------- |
+| `nacos-data-id`     | 该字段子树的数据源，任意层级可用，多层重声明时内层覆盖外层 |
+| `nacos-group`       | 覆盖该字段子树的 group，缺省用 DSN 的`group`             |
+| `nacos-namespace`   | 覆盖该字段子树的 namespace，缺省用 DSN 的`namespace`     |
+| `nacos-default`     | 字段仍是零值时填入的默认值                                 |
+| `nacos-required`    | 默认值生效后仍为零值则报错，错误里带字段路径与 dataId      |
+| `nacos-description` | 供`GetDescription` 输出的说明                            |
+| `nacos-layout`      | 默认值转`time.Time` 等类型时使用的时间布局               |
+| `nacos-separator`   | 默认值转 slice / map 时使用的分隔符，缺省`,`             |
 
 除上述标签外，字段的键名照常由 `yaml` / `json` / `toml` tag 决定。
 
@@ -209,15 +209,15 @@ func ParseTOML(r io.Reader, cfg interface{}) error
 
 v0.1.0 是破坏性变更：库不再复用 cleanenv，也不再读取环境变量。
 
-| v0.0.x | v0.1.0 |
-| --- | --- |
-| `nacos://host:8848/app.yaml`（DSN 带 dataId） | `nacos://host:8848` + 字段 `nacos-data-id:"app.yaml"` |
-| `env:"HOST"` / `env-default` / `env-required` / `env-description` / `env-layout` / `env-separator` | 对应改成 `nacos-default` / `nacos-required` / `nacos-description` / `nacos-layout` / `nacos-separator`；字段名不再指向环境变量 |
-| 环境变量覆盖 Nacos 内容 | 只有 Nacos 内容与 `nacos-default`，环境变量不再参与 |
-| 空配置默认报错，`allowEmpty=true` 放开 | 空内容一律按空文档处理，`allowEmpty` 参数移除 |
-| `ReadEnv` / `UpdateEnv` / `Usage` / `FUsage` / `TagEnv*` / `Updater` | 已删除 |
-| `.env` / `.edn` 格式 | 已移除，只保留 `.yaml` / `.yml` / `.json` / `.toml` |
-| 只能监听 DSN 里的一个 dataId | `Watch` 同时监听结构体声明的全部 dataId |
+| v0.0.x                                                                                                         | v0.1.0                                                                                                                                  |
+| -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `nacos://host:8848/app.yaml`（DSN 带 dataId）                                                                | `nacos://host:8848` + 字段 `nacos-data-id:"app.yaml"`                                                                               |
+| `env:"HOST"` / `env-default` / `env-required` / `env-description` / `env-layout` / `env-separator` | 对应改成`nacos-default` / `nacos-required` / `nacos-description` / `nacos-layout` / `nacos-separator`；字段名不再指向环境变量 |
+| 环境变量覆盖 Nacos 内容                                                                                        | 只有 Nacos 内容与`nacos-default`，环境变量不再参与                                                                                    |
+| 空配置默认报错，`allowEmpty=true` 放开                                                                       | 空内容一律按空文档处理，`allowEmpty` 参数移除                                                                                         |
+| `ReadEnv` / `UpdateEnv` / `Usage` / `FUsage` / `TagEnv*` / `Updater`                               | 已删除                                                                                                                                  |
+| `.env` / `.edn` 格式                                                                                       | 已移除，只保留`.yaml` / `.yml` / `.json` / `.toml`                                                                              |
+| 只能监听 DSN 里的一个 dataId                                                                                   | `Watch` 同时监听结构体声明的全部 dataId                                                                                               |
 
 ## 开发
 
@@ -231,6 +231,34 @@ make tidy                # go mod tidy
 # 集成测试：需要可用的 Nacos，未设置环境变量则自动跳过
 CLEANNACOS_TEST_ADDR=127.0.0.1:8848 make integration-test
 ```
+
+### 用 Docker 起一个本地 Nacos
+
+仓库自带的 `docker-compose.yml` 会启动一个单机 Nacos（`nacos/nacos-server:v2.5.2`，与 CI 同版本，关闭鉴权，数据不落盘），需要本机 Docker 已启动：
+
+| 命令                            | 作用                                                                   |
+| ------------------------------- | ---------------------------------------------------------------------- |
+| `make nacos-up`               | 后台启动 Nacos（容器名`cleannacos-nacos`，默认映射 8848/9848）       |
+| `make nacos-wait`             | 轮询就绪探针，最多等 120 秒                                            |
+| `make integration-test-local` | 起 Nacos → 等就绪 → 跑集成测试 → 无论成败都清理容器                 |
+| `make example-e2e`            | 往 Nacos 写入示例配置，实际运行`example/simple` 与 `example/watch` |
+| `make verify-local`           | 上面两步合起来：一次命令完成集成测试 + 示例端到端，结束后自动清理      |
+| `make nacos-down`             | 停掉容器并删除其中的数据                                               |
+
+```bash
+make verify-local        # 推荐：一条命令完成真实 Nacos 验证
+make nacos-up            # 或者手动控制生命周期
+make example-e2e
+make nacos-down
+```
+
+默认端口是 8848/9848，可以整体挪开（Nacos SDK 用 HTTP 端口 +1000 推导 gRPC，所以 gRPC 端口会跟着走，集成测试地址也自动跟随）：
+
+```bash
+make verify-local NACOS_HTTP_PORT=18848
+```
+
+如果 8848 已被别的服务占用（例如本机另有一个 Nacos 容器），`nacos-up` 会直接报端口冲突，用上面的方式换端口即可。
 
 集成测试支持的环境变量：
 
