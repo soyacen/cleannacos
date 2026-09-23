@@ -1,6 +1,6 @@
 # cleannacos - 纯 Nacos 配置读取库
 
-`cleannacos` 只从 Nacos 读取配置：DSN 描述 Nacos 服务端，配置结构体的 `nacos-*` tag 描述每个字段来自哪个 dataId、哪个 group、哪个 namespace。不读环境变量，也不读本地文件。
+`cleannacos` 只从 Nacos 读取配置：DSN 描述 Nacos 服务端，配置结构体的 `nacos-*` tag 描述每个字段来自哪个 dataId、哪个 group、哪个 namespace。
 
 ```go
 type Config struct {
